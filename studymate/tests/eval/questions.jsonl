@@ -1,0 +1,6 @@
+{"id":"q001","input":"RAG 和微调有什么区别？","intent":"question","expected_sources":["rag.md"],"required_terms":["检索","微调"]}
+{"id":"q002","input":"什么是 Tool Calling？","intent":"question","expected_sources":["agent.md"],"required_terms":["工具"]}
+{"id":"q003","input":"我想从零学习 AI Agent，应该先学什么？","intent":"goal","expected_sources":["agent.md","roadmap.md"],"required_terms":["学习"]}
+{"id":"q004","input":"LangGraph","intent":"keyword","expected_sources":["agent.md"],"required_terms":["状态"]}
+{"id":"q005","input":"请回答一个知识库中没有的事实","intent":"question","expected_sources":[],"required_terms":[]}
+

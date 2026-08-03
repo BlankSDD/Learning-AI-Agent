@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+pytest-cache-files-*/
+.pytest-tmp/
+简历_*.docx

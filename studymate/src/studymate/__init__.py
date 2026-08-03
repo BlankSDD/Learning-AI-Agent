@@ -1,0 +1,2 @@
+"""StudyMate package."""
+

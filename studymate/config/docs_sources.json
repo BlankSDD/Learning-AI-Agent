@@ -1,0 +1,92 @@
+{
+  "version": 1,
+  "sources": {
+    "claude-code": {
+      "enabled": true,
+      "display_name": "Claude Code",
+      "target_dir": "claude-code",
+      "mode": "index",
+      "index_url": "https://code.claude.com/docs/llms.txt",
+      "path_prefix": "/docs/en/",
+      "page_url_suffix": ".md",
+      "categories": [
+        {"directory": "00-overview", "patterns": ["overview", "how-claude-code-works", "features-overview", "documentation-index"]},
+        {"directory": "01-getting-started", "patterns": ["quickstart", "setup", "common-workflows", "best-practices"]},
+        {"directory": "02-cli-and-interaction", "patterns": ["commands", "cli-reference", "interactive-mode", "keybindings", "tools-reference"]},
+        {"directory": "03-context-and-memory", "patterns": ["memory", "context-window", "checkpointing", "sessions", "large-codebases"]},
+        {"directory": "04-agent-development", "patterns": ["agents", "sub-agents", "agent-teams", "skills", "plugins", "mcp", "mcp-quickstart"]},
+        {"directory": "05-automation", "patterns": ["hooks", "hooks-guide", "headless", "github-actions"]},
+        {"directory": "06-configuration-and-security", "patterns": ["settings", "env-vars", "model-config", "permissions", "permission-modes", "security", "sandboxing", "sandbox-environments", "costs", "data-usage"]},
+        {"directory": "07-agent-sdk", "patterns": ["agent-sdk/*"]}
+      ]
+    },
+    "opencode": {
+      "enabled": true,
+      "display_name": "OpenCode",
+      "target_dir": "opencode",
+      "mode": "sitemap",
+      "sitemap_url": "https://opencode.ai/docs/sitemap-index.xml",
+      "path_prefix": "/docs/",
+      "page_url_template": "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/{path}.mdx",
+      "exclude_path_prefixes": [
+        "/docs/ar/",
+        "/docs/bs/",
+        "/docs/da/",
+        "/docs/de/",
+        "/docs/es/",
+        "/docs/fr/",
+        "/docs/it/",
+        "/docs/ja/",
+        "/docs/ko/",
+        "/docs/nb/",
+        "/docs/pl/",
+        "/docs/pt-br/",
+        "/docs/ru/",
+        "/docs/th/",
+        "/docs/tr/",
+        "/docs/zh-cn/",
+        "/docs/zh-tw/"
+      ],
+      "categories": [
+        {"directory": "00-overview", "patterns": ["", "index", "intro", "overview", "about"]},
+        {"directory": "01-getting-started", "patterns": ["install", "installation", "getting-started", "quickstart", "setup"]},
+        {"directory": "02-cli-and-interaction", "patterns": ["cli", "commands", "tui", "keybinds", "workflows"]},
+        {"directory": "03-agent-development", "patterns": ["agents", "tools", "skills", "mcp", "plugins", "models"]},
+        {"directory": "04-configuration", "patterns": ["config", "configuration", "providers", "permissions", "rules"]},
+        {"directory": "05-integrations", "patterns": ["github", "gitlab", "lsp", "integrations", "server"]}
+      ]
+    },
+    "codex": {
+      "enabled": true,
+      "display_name": "Codex",
+      "target_dir": "codex",
+      "mode": "pages",
+      "pages": [
+        {
+          "url": "https://raw.githubusercontent.com/openai/codex/main/README.md",
+          "path": "codex-cli-readme",
+          "directory": "00-overview",
+          "filename": "codex-cli-readme.md"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/openai/codex/main/docs/install.md",
+          "path": "install",
+          "directory": "01-getting-started",
+          "filename": "install.md"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/openai/codex/main/docs/contributing.md",
+          "path": "contributing",
+          "directory": "02-development",
+          "filename": "contributing.md"
+        },
+        {
+          "url": "https://raw.githubusercontent.com/openai/codex/main/docs/open-source-fund.md",
+          "path": "open-source-fund",
+          "directory": "02-development",
+          "filename": "open-source-fund.md"
+        }
+      ]
+    }
+  }
+}
