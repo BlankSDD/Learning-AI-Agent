@@ -1,8 +1,35 @@
 # StudyMate
 
-StudyMate 是一个运行在命令行中的个人学习资料对话助手。
+StudyMate 是一个运行在命令行中的本地知识库学习 Agent，也是一个用于理解 RAG、Tool Calling、Agent Runtime、Trace 和 Eval 的工程化练习项目。
 
-它读取本地 Markdown / TXT 学习资料，根据用户的问题、学习目标或关键词检索相关知识，调用大模型生成带来源的回答、学习建议或下一步问题。
+它读取本地 Markdown / TXT 学习资料，让模型自行决定是否调用受限工具检索或打开文档，再生成带来源的回答、学习建议或下一步问题。项目不追求通用聊天能力，而是优先保证工具边界、引用来源、停止条件和可观察性。
+
+## 项目定位
+
+当前实现的是一个最小、可验证的 Agent Runtime：
+
+- 面向个人学习资料，不读取知识库之外的文件，也不执行 Shell 或修改文件。
+- 只开放 `search_knowledge` 和 `open_document` 两个只读工具。
+- 通过工具预算、空检索和最大步数防止模型循环消耗 Token。
+- 通过引用校验阻止模型捏造来源。
+- 通过 `/trace` 和 JSONL 会话文件记录一次任务如何执行；Trace 不会回传给模型。
+
+它适合作为下一步学习 Agent Eval、查询规范化、混合检索、MCP 和 AI Coding Agent 的基础，而不是作为生产知识库产品直接使用。
+
+## 当前架构
+
+```text
+用户问题
+  -> ChatService：命令、短期对话历史、最终展示
+  -> AgentRunner：步骤上限、工具预算、停止条件、Trace
+  -> OpenAIAnswerer：OpenAI-compatible 模型和流式 Tool Calling 适配
+  -> ToolRegistry：Schema 校验和受控工具执行
+       -> search_knowledge / open_document
+  -> 引用校验 + Answer
+  -> TraceStore：问题、回答、执行摘要追加到 JSONL
+```
+
+`Agent Loop` 是其中“模型决定 -> 工具执行 -> 观察结果 -> 再决定”的循环；`Agent Runtime` 则是上面整套模型适配、工具、状态、限制、Trace 和错误处理机制。
 
 ## 1. 知识库放在哪里
 
@@ -33,6 +60,7 @@ studymate/
       rag.md
       tool-calling.md
       evaluation.md
+  traces/                 # 自动生成的问答与 Agent Trace，默认不提交 Git
 ~~~
 
 支持的文件扩展名：
@@ -104,6 +132,14 @@ py -m studymate ingest .\knowledge
 py -m studymate chat --knowledge .\knowledge
 ~~~
 
+每次 Agent 问答会追加到一个 JSONL 会话文件。默认目录是 `traces/`；也可以指定其他路径：
+
+~~~powershell
+py -m studymate chat --trace-dir .\my-traces
+~~~
+
+对话中输入 `/trace` 可查看上一轮的工具调用、工具结果摘要、停止原因和耗时。Trace 不会作为上下文再次发送给模型。
+
 ## 4. 自动更新在线开发文档
 
 文档源配置位于：
@@ -167,10 +203,11 @@ STUDYMATE_MODEL=claude-sonnet-4-5-20250929
 - `STUDYMATE_API_KEY` 是模型服务密钥。
 - `STUDYMATE_BASE_URL` 是 OpenAI 兼容接口根地址。
 - `STUDYMATE_MODEL` 是供应商支持的模型名称。
+- `STUDYMATE_MAX_TOKENS` 是单次 Agent 模型请求允许生成的最大 Token 数，默认 `4096`。
 - 对 `provider=newapi`，如果 Base URL 没有路径，程序会自动补充 `/v1`。
 - `STUDYMATE_DEBUG=true` 会输出脱敏的请求诊断信息，排查完成后建议改为 `false`。
 - `STUDYMATE_RESPONSE_FORMAT` 可设为 `json_object` 或 `none`。NewAPI/Claude 兼容接口默认建议使用 `none`，避免上游拦截该参数；程序仍会通过 Prompt 要求模型返回 JSON。
-- `STUDYMATE_STREAM=true` 使用流式请求并在本地聚合完整回答，适合 NewAPI/Claude 兼容接口。
+- `STUDYMATE_STREAM` 控制流式响应。留空时，NewAPI 自动启用流式模式，其他兼容接口默认关闭；若使用 NewAPI/Claude，建议保持留空或显式设为 `true`。Agent 会在内部聚合完整响应后再显示答案。
 - `STUDYMATE_USER_AGENT` 用于覆盖 HTTP 客户端 User-Agent。默认是 `ai-sdk/openai-compatible/2.0.37`，用于兼容会拦截 `OpenAI/Python` 的网关（例如当前 Huazi Cloudflare 配置）。
 - `STUDYMATE_HTTP_REFERER`、`STUDYMATE_X_TITLE` 和 `STUDYMATE_EXTRA_HEADERS_JSON` 用于传递供应商要求的额外请求头。
 - STUDYMATE_DOCS_PROXY 是在线文档更新使用的 HTTP 代理，例如 `http://127.0.0.1:7897`。
@@ -209,12 +246,13 @@ STUDYMATE_API_KEY=填写你的 DeepSeek API Key
 - CLI 对话服务。
 - 问题、学习目标、关键词输入分类。
 - 回答来源校验。
-- /help、/sources、/reset、/quit 命令。
+- /help、/sources、/trace、/reset、/quit 命令。
 - OpenAI 兼容模型调用适配。
 - 自动更新 Claude Code、OpenCode、Codex 官方 Markdown 文档。
 - 第一阶段最小 Agent Runtime。
 - 原生 Tool Calling 和工具结果回传。
 - `search_knowledge`、`open_document` 两个只读工具。
+- Agent Trace、`/trace` 和按会话 JSONL 问答记录。
 
 当前搜索基线是本地内存关键词检索。后续根据评估结果再升级 SQLite FTS5、Embedding 或混合检索。
 
@@ -225,16 +263,17 @@ StudyMate 的 CLI 当前采用：
 ~~~text
 用户问题
   -> AgentRunner
-  -> 模型决定是否调用工具
+  -> 模型决定是否调用可用工具
   -> ToolRegistry 校验并执行工具
   -> 工具结果作为观察消息返回模型
-  -> 模型继续调用工具或生成最终 Answer
+  -> 模型继续调用工具或进入最终化
   -> 校验引用并显示答案
+  -> 追加问题、回答和执行摘要到 Trace JSONL
 ~~~
 
 ### 7.1 是否流式
 
-普通 RAG 兼容路径支持 NewAPI 流式请求。第一阶段 Agent 请求暂时强制使用非流式模式，确保 Tool Calling 的完整消息和参数可以可靠解析；当前 CMD 仍会一次性打印结构化答案。
+普通 RAG 和 Agent 都可使用流式请求。`STUDYMATE_STREAM` 留空时，NewAPI 默认开启流式，其他 Provider 默认关闭；NewAPI/Claude 建议显式设为 `true`。Agent 在本地聚合完整的工具调用增量和最终 JSON 后，CMD 再一次性打印答案，因此当前不是逐 Token 展示。
 
 对应代码：
 
@@ -245,22 +284,24 @@ StudyMate 的 CLI 当前采用：
 
 ### 7.2 是否有历史记录
 
-当前有“当前进程内的短期历史”，但没有持久化历史：
+当前有“当前进程内的短期历史”，也有独立的本地执行记录：
 
 - 每次问答会保存用户问题和模型回答。
 - 默认最多保留 10 条消息。
 - 实际发送给模型时使用最近 6 条消息，约 3 轮对话。
-- `/reset` 会清空历史。
-- 退出程序或重新启动后，历史会丢失。
-- 当前没有 SQLite、文件会话或用户会话 ID。
+- `/reset` 会清空内存中的对话历史，不会删除已落盘的 Trace。
+- 退出程序或重新启动后，对话历史会丢失，且不会从 Trace 自动恢复。
+- 每次 Agent 问答会追加到 `traces/session-<id>.jsonl`。其中包含问题、最终回答、来源和工具执行摘要，但不含 API Key、HTTP 请求头或完整知识库正文；`traces/` 已被 Git 忽略。
 
-对应代码：`src/studymate/chat.py`、`src/studymate/llm.py`。
+因此，Trace 是开发排查与复盘记录，不是 Memory，也不会影响下一轮模型回答。
+
+对应代码：`src/studymate/chat.py`、`src/studymate/trace.py`、`src/studymate/llm.py`。
 
 ### 7.3 检索和模型的边界
 
 Agent 不再由 `ChatService` 固定执行检索，而是把 `search_knowledge` 暴露给模型，由模型根据问题自主决定是否检索。历史会发送给模型帮助理解“它”“上一个问题”等指代，但当前不会使用历史改写检索问题。
 
-如果没有检索到证据，StudyMate 会直接返回“知识库中没有足够依据”，不会调用模型。检索到证据后，模型只能基于传入片段生成回答。
+`search_knowledge` 没有返回证据时，`AgentRunner` 会以 `empty_search` 停止本轮任务，直接返回“知识库资料不足”，不会继续请求模型。检索到证据后，模型只能基于传入片段生成回答。
 
 模型返回的引用还会经过校验。如果引用不属于本次检索结果，回答会被拦截，避免产生无法追溯的来源。
 
@@ -269,11 +310,12 @@ Agent 不再由 `ChatService` 固定执行检索，而是把 `search_knowledge` 
 | 能力 | 当前状态 |
 | --- | --- |
 | 本地 Markdown/TXT 检索 | 已实现 |
-| AI 模型生成回答 | 已实现；普通路径支持流式，Agent 路径暂时非流式 |
-| Agent 工具调用循环 | 已实现，最多 5 步 |
+| AI 模型生成回答 | 已实现；普通路径与 Agent 路径均可使用流式 |
+| Agent 工具调用循环 | 已实现，最多 5 步；每个只读工具默认每轮任务仅可成功调用一次，重复调用后强制进入最终化 |
 | Agent 工具注册和参数校验 | 已实现 |
 | 当前会话短期历史 | 已实现，仅内存保存 |
-| 历史持久化 | 尚未实现 |
+| Agent Trace 和问答落盘 | 已实现，按进程写入 `traces/session-*.jsonl`，不参与模型上下文 |
+| 跨进程恢复会话历史 | 尚未实现 |
 | 基于历史改写检索 | 尚未实现 |
 | Embedding/向量检索 | 尚未实现 |
 | 流式请求 | 已实现；当前 CMD 聚合完整 JSON 后一次性显示 |
@@ -298,8 +340,12 @@ Agent 不再由 `ChatService` 固定执行检索，而是把 `search_knowledge` 
 | 2026-08-02 | Cherry Studio / Huazi 请求兼容 | `src/studymate/llm.py`、`.env`、`.env.example`、`tests/contract/test_llm_contract.py` | 对齐 Cherry Studio 的 `/v1`、额外 headers、流式请求和 `ai-sdk/openai-compatible/2.0.37` User-Agent；定位并修复 Huazi Cloudflare 拦截 `OpenAI/Python` 导致的 403；测试结果为 `29 passed`（另有 3 个受本机 pytest 临时目录权限影响的用例未执行）。 |
 | 2026-08-02 | Claude 引用格式兼容 | `src/studymate/llm.py`、`tests/contract/test_llm_contract.py` | 将模型返回的已检索 `chunk_id` 字符串补全为可审计引用对象；非法响应转换为可读错误，不再导致 CLI 堆栈退出；真实 CMD 问答验证通过。 |
 | 2026-08-07 | 第一阶段最小 Agent | `src/studymate/agent.py`、`src/studymate/tool_registry.py`、`src/studymate/tools.py`、`src/studymate/llm.py` | 增加有步数上限的 Agent Loop、原生 Tool Calling、知识库搜索和安全文档读取工具；新增 Agent 和工具 TDD 用例。 |
+| 2026-08-09 | NewAPI/Claude Agent 流式兼容 | `src/studymate/llm.py`、`src/studymate/agent.py`、`.env.example`、`tests/contract/test_llm_contract.py` | 聚合流式 `tool_calls` 增量，兼容内容块格式和 `confidence: "high"` 等常见模型输出；NewAPI 留空时自动启用流式。以 Huazi/Claude 真实问答验证工具调用和最终回答均成功；全量测试 `46 passed`。 |
+| 2026-08-09 | Agent 工具预算与最终化 | `src/studymate/agent.py`、`src/studymate/llm.py`、`tests/unit/test_agent.py`、`tests/contract/test_llm_contract.py` | 每个工具默认只允许调用一次；重复调用会切换到无工具最终化。为兼容 Bedrock，上述最终化会将工具结果转为普通上下文后再请求模型，避免 `TOOL_CONFIG_MISSING`；以 Huazi/Claude 真实问答验证不会再循环至步骤上限。 |
+| 2026-08-09 | Claude 最终 JSON 兼容 | `src/studymate/llm.py`、`tests/contract/test_llm_contract.py` | 响应解析器兼容 `confidence: "high"` 和 `next_steps: "单条建议"` 等常见变体，统一为内部 `Answer` 类型要求的数值和字符串列表。 |
+| 2026-08-09 | Agent Trace 与问答落盘 | `src/studymate/trace.py`、`src/studymate/agent.py`、`src/studymate/chat.py`、`src/studymate/cli.py`、`tests/unit/test_trace.py` | 每轮记录工具可用性、调用、结果摘要、停止原因和耗时；问题与回答追加到按会话分组的 JSONL。新增 `/trace` 查看上一轮，不将 Trace 传回模型。 |
 
-当前待办方向：先验证不同模型网关的原生 Tool Calling 兼容性，再增加 Agent 执行轨迹和评估数据；之后再做历史持久化、Embedding 或混合检索。
+当前待办方向：先学习并实现 Agent Eval，再做查询规范化与检索评估；之后再评估 Embedding/混合检索、可控的跨进程记忆和 MCP。
 
 ## 9. 开发流程
 
@@ -341,11 +387,14 @@ flowchart TD
     H -- 是 --> J[执行 search_knowledge 或 open_document]
     J --> K[追加工具结果]
     I --> K
-    K --> L{未超过 5 步?}
-    L -- 是 --> D
-    L -- 否 --> M[安全停止]
-    F --> N[校验引用并输出来源]
-    M --> N
+    K --> L{空检索或工具预算耗尽?}
+    L -- 是 --> M[安全停止或最终化]
+    L -- 否 --> N{未超过 5 步?}
+    N -- 是 --> D
+    N -- 否 --> M
+    F --> O[校验引用并输出来源]
+    M --> O
+    O --> P[写入 Trace JSONL]
 ```
 
 ### 10.2 代码位置
@@ -354,10 +403,13 @@ flowchart TD
 - `src/studymate/tool_registry.py`：工具注册、Schema、参数校验和分发。
 - `src/studymate/tools.py`：知识库工具实现和路径安全校验。
 - `src/studymate/llm.py`：OpenAI-compatible 原生 Tool Calling 请求。
+- `src/studymate/trace.py`：结构化执行轨迹和 JSONL 会话文件。
+- `src/studymate/chat.py`：短期历史、`/trace` 和问答落盘。
 - `tests/unit/test_agent.py`：Agent Loop、连续调用和最大步数测试。
+- `tests/unit/test_trace.py`：Trace 格式化和 JSONL 落盘测试。
 - `tests/unit/test_tools.py`：工具输出、参数错误和路径穿越测试。
 
-第一阶段 Agent 请求使用非流式模式，要求当前模型网关支持 OpenAI-compatible `tools` 和 `tool_calls`。原有普通 RAG 问答仍保留兼容接口。
+第一阶段 Agent 支持由 `STUDYMATE_STREAM` 控制的流式或非流式请求；无论哪种模式，都要求当前模型网关支持 OpenAI-compatible `tools` 和 `tool_calls`。流式模式在本地聚合后才输出最终答案。
 
 详细设计见：
 
@@ -379,4 +431,6 @@ flowchart TD
 
 知识问答、项目决策和阶段复盘保存在 `docs/learning-log/`。当前记录：
 
+- [学习路线与每日任务](docs/learning-log/00-learning-roadmap.md)
 - [2026-08-09 Agent 基础与 StudyMate 第一阶段](docs/learning-log/2026-08-09-agent-foundations.md)
+- [2026-08-10 Agent 可观测性与评估](docs/learning-log/2026-08-10-agent-observability-and-evaluation.md)

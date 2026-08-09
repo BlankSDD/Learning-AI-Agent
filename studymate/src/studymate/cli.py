@@ -10,6 +10,7 @@ from .ingest import chunk_document, load_documents
 from .llm import OpenAIAnswerer
 from .search import InMemorySearchIndex
 from .tools import KnowledgeTools, build_knowledge_tool_registry
+from .trace import TraceStore
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,6 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="document source configuration used by /update",
     )
     chat.add_argument("--proxy", help="HTTP proxy used by /update")
+    chat.add_argument(
+        "--trace-dir",
+        type=Path,
+        default=Path("traces"),
+        help="directory receiving per-session question/answer/trace JSONL files",
+    )
     return parser
 
 
@@ -99,6 +106,7 @@ def run_chat(
     top_k: int,
     docs_config: Path,
     proxy: str | None,
+    trace_dir: Path,
 ) -> int:
     documents = load_documents(knowledge_dir)
     chunks = [chunk for document in documents for chunk in chunk_document(document)]
@@ -140,8 +148,10 @@ def run_chat(
         agent=agent,
         top_k=top_k,
         update_handler=update_handler,
+        trace_store=TraceStore(trace_dir),
     )
     print(f"StudyMate loaded {len(documents)} documents. Type /help for commands.")
+    print(f"Trace records: {service.trace_store.path}")
     while True:
         try:
             text = input("You> ").strip()
@@ -179,7 +189,13 @@ def main() -> int:
             workers=args.workers,
         )
     if args.command == "chat":
-        return run_chat(args.knowledge, args.top_k, args.docs_config, args.proxy)
+        return run_chat(
+            args.knowledge,
+            args.top_k,
+            args.docs_config,
+            args.proxy,
+            args.trace_dir,
+        )
     return 2
 
 

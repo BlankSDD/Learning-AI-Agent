@@ -2,7 +2,12 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 
-from studymate.docs_updater import classify_page, extract_page_urls, update_sources
+from studymate.docs_updater import (
+    classify_page,
+    extract_page_urls,
+    resolve_proxy,
+    update_sources,
+)
 
 
 def test_extract_page_urls_adds_markdown_suffix_and_filters_external_links():
@@ -24,6 +29,12 @@ def test_classify_page_uses_configured_category_and_fallback():
 
     assert classify_page("quickstart", source) == "01-start"
     assert classify_page("unknown-topic", source) == "99-other"
+
+
+def test_resolve_proxy_allows_an_explicitly_disabled_proxy(monkeypatch):
+    monkeypatch.setenv("STUDYMATE_DOCS_PROXY", "http://127.0.0.1:7897")
+
+    assert resolve_proxy("") is None
 
 
 def test_update_sources_writes_pages_and_source_metadata(tmp_path):

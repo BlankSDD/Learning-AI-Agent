@@ -70,6 +70,104 @@ def _safe_error_details(error: Exception) -> str:
     return details[:600]
 
 
+def _content_text(content: Any) -> str | None:
+    if isinstance(content, str):
+        return content or None
+    if not isinstance(content, list):
+        return None
+
+    text_parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict):
+            block_type = block.get("type")
+            value = block.get("text")
+            if block_type in {"text", "output_text"} and isinstance(value, str):
+                text_parts.append(value)
+        else:
+            block_type = getattr(block, "type", None)
+            value = getattr(block, "text", None)
+            if block_type in {"text", "output_text"} and isinstance(value, str):
+                text_parts.append(value)
+    return "".join(text_parts) or None
+
+
+def _content_tool_calls(content: Any) -> list[dict[str, Any]]:
+    if not isinstance(content, list):
+        return []
+
+    calls: list[dict[str, Any]] = []
+    for index, block in enumerate(content):
+        if isinstance(block, dict):
+            block_type = block.get("type")
+            name = block.get("name")
+            arguments = block.get("input", block.get("arguments"))
+            call_id = block.get("id") or f"content-tool-call-{index}"
+            function = block.get("function")
+            if isinstance(function, dict):
+                name = name or function.get("name")
+                arguments = arguments or function.get("arguments")
+        else:
+            block_type = getattr(block, "type", None)
+            name = getattr(block, "name", None)
+            arguments = getattr(block, "input", None)
+            if arguments is None:
+                arguments = getattr(block, "arguments", None)
+            call_id = getattr(block, "id", None) or f"content-tool-call-{index}"
+
+        if block_type in {"tool_use", "function_call", "tool-call"} and name:
+            calls.append(
+                {
+                    "id": call_id,
+                    "name": name,
+                    "arguments": arguments or {},
+                }
+            )
+    return calls
+
+
+def _response_shape(message: Any, choice: Any) -> str:
+    content = getattr(message, "content", None)
+    tool_calls = getattr(message, "tool_calls", None) or []
+    reasoning = getattr(message, "reasoning_content", None)
+    refusal = getattr(message, "refusal", None)
+    if isinstance(content, str):
+        content_shape = f"str:{len(content)}"
+    elif isinstance(content, list):
+        content_shape = f"list:{len(content)}"
+    elif content is None:
+        content_shape = "none"
+    else:
+        content_shape = type(content).__name__
+    reasoning_shape = (
+        f"{type(reasoning).__name__}:{len(reasoning)}"
+        if isinstance(reasoning, str)
+        else ("none" if reasoning is None else type(reasoning).__name__)
+    )
+    fields: list[str] = []
+    model_dump = getattr(message, "model_dump", None)
+    if callable(model_dump):
+        try:
+            fields = sorted(model_dump().keys())
+        except Exception:
+            fields = []
+    return (
+        f"finish_reason={getattr(choice, 'finish_reason', None)} "
+        f"content={content_shape} tool_calls={len(tool_calls)} "
+        f"content_tool_calls={len(_content_tool_calls(content))} "
+        f"reasoning={reasoning_shape} refusal={'yes' if refusal else 'no'} "
+        f"message_fields={','.join(fields) or '(unknown)'}"
+    )
+
+
+def _debug_content_preview(content: str | None, limit: int = 1_200) -> str:
+    if not content:
+        return "(empty)"
+    compact = " ".join(content.split())
+    if len(compact) > limit:
+        return f"{compact[:limit]}..."
+    return compact
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     value = _env_value(name)
     if value is None:
@@ -139,8 +237,52 @@ class LLMResponseParser:
                 if start < 0 or end <= start:
                     raise
                 payload = json.loads(text[start : end + 1])
+        payload = self._normalize_confidence(payload)
+        payload = self._normalize_next_steps(payload)
         payload = self._normalize_citations(payload, evidence or [])
         return Answer.model_validate(payload)
+
+    @staticmethod
+    def _normalize_confidence(payload: dict[str, Any]) -> dict[str, Any]:
+        """Accept common provider confidence labels while keeping Answer numeric."""
+        confidence = payload.get("confidence")
+        if not isinstance(confidence, str):
+            return payload
+
+        normalized = confidence.strip().lower()
+        levels = {
+            "very high": 0.95,
+            "high": 0.85,
+            "medium": 0.6,
+            "moderate": 0.6,
+            "low": 0.3,
+            "very low": 0.1,
+            "高": 0.85,
+            "较高": 0.75,
+            "中": 0.6,
+            "中等": 0.6,
+            "低": 0.3,
+            "较低": 0.2,
+        }
+        if normalized in levels:
+            return {**payload, "confidence": levels[normalized]}
+
+        if normalized.endswith("%"):
+            try:
+                percentage = float(normalized[:-1].strip())
+            except ValueError:
+                return payload
+            if 0 <= percentage <= 100:
+                return {**payload, "confidence": percentage / 100}
+        return payload
+
+    @staticmethod
+    def _normalize_next_steps(payload: dict[str, Any]) -> dict[str, Any]:
+        """Accept a single suggested next step from compatible model gateways."""
+        next_steps = payload.get("next_steps")
+        if isinstance(next_steps, str):
+            return {**payload, "next_steps": [next_steps]}
+        return payload
 
     @staticmethod
     def _normalize_citations(
@@ -211,6 +353,7 @@ def build_prompt(
         "If evidence is insufficient, set need_more_context to true. "
         "Return JSON with answer, citations, confidence, "
         "need_more_context, and next_steps. "
+        "confidence must be a decimal number from 0 to 1, not a text label. "
         "Each citation must be an object with chunk_id, path, title, "
         "start_line, end_line, and quote. Use only supplied chunk_id values. "
         "Do not return citation IDs as bare strings."
@@ -278,6 +421,13 @@ class OpenAIAnswerer:
             _env_value("STUDYMATE_RESPONSE_FORMAT")
             or ("none" if self.provider.lower() == "newapi" else "json_object")
         ).lower()
+        raw_max_tokens = _env_value("STUDYMATE_MAX_TOKENS") or "4096"
+        try:
+            self.max_tokens = int(raw_max_tokens)
+        except ValueError as exc:
+            raise ValueError("STUDYMATE_MAX_TOKENS 必须是正整数") from exc
+        if self.max_tokens <= 0:
+            raise ValueError("STUDYMATE_MAX_TOKENS 必须是正整数")
         if self.provider_type.lower() != "openai_compatible":
             raise ValueError(
                 "当前只支持 STUDYMATE_TYPE=openai_compatible 的模型服务"
@@ -414,22 +564,46 @@ class OpenAIAnswerer:
         )
         self._debug(
             f"agent_request={endpoint} provider={self.provider} model={self.model} "
-            f"message_count={len(messages)} tool_count={len(tools)} stream=false"
+            f"message_count={len(messages)} tool_count={len(tools)} "
+            f"stream={str(self.stream).lower()} max_tokens={self.max_tokens}"
         )
         try:
             client = OpenAI(**client_kwargs)
-            response = client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                tools=tools,
-                tool_choice="auto",
-                temperature=0.2,
-                stream=False,
-            )
-            message = response.choices[0].message
+            request_kwargs: dict[str, Any] = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": 0.2,
+                "max_tokens": self.max_tokens,
+                "stream": self.stream,
+            }
+            if tools:
+                request_kwargs["tools"] = tools
+                request_kwargs["tool_choice"] = "auto"
+            response = client.chat.completions.create(**request_kwargs)
+            if self.stream:
+                return self._parse_streaming_tool_response(response)
+
+            choice = response.choices[0]
+            message = choice.message
+            raw_content = getattr(message, "content", None)
+            fallback_content_calls = _content_tool_calls(raw_content)
+            self._debug(f"agent_response_shape {_response_shape(message, choice)}")
             tool_calls: list[ToolCallRequest] = []
-            for index, call in enumerate(message.tool_calls or []):
-                raw_arguments = call.function.arguments or "{}"
+            standard_tool_calls = getattr(message, "tool_calls", None) or []
+            if standard_tool_calls:
+                parsed_tool_calls = [
+                    {
+                        "id": call.id or f"tool-call-{index}",
+                        "name": call.function.name,
+                        "arguments": call.function.arguments or "{}",
+                    }
+                    for index, call in enumerate(standard_tool_calls)
+                ]
+            else:
+                parsed_tool_calls = fallback_content_calls
+
+            for call in parsed_tool_calls:
+                raw_arguments = call["arguments"]
                 if isinstance(raw_arguments, str):
                     try:
                         arguments: dict[str, Any] | str = json.loads(raw_arguments)
@@ -439,13 +613,13 @@ class OpenAIAnswerer:
                     arguments = raw_arguments
                 tool_calls.append(
                     ToolCallRequest(
-                        id=call.id or f"tool-call-{index}",
-                        name=call.function.name,
+                        id=call["id"],
+                        name=call["name"],
                         arguments=arguments,
                     )
                 )
             return ModelToolResponse(
-                content=message.content,
+                content=_content_text(raw_content),
                 tool_calls=tool_calls,
             )
         except Exception as exc:
@@ -460,6 +634,62 @@ class OpenAIAnswerer:
                 f"{message} 当前配置：provider={self.provider}，"
                 f"base_url={endpoint}，model={self.model}。"
             ) from exc
+
+    def _parse_streaming_tool_response(self, response: Any):
+        from .agent import ModelToolResponse, ToolCallRequest
+
+        content_parts: list[str] = []
+        partial_calls: dict[int | str, dict[str, str]] = {}
+        finish_reason: str | None = None
+
+        for chunk in response:
+            for choice in getattr(chunk, "choices", None) or []:
+                if getattr(choice, "finish_reason", None):
+                    finish_reason = choice.finish_reason
+                delta = getattr(choice, "delta", None)
+                if delta is None:
+                    continue
+
+                text = getattr(delta, "content", None)
+                if isinstance(text, str):
+                    content_parts.append(text)
+
+                for raw_call in getattr(delta, "tool_calls", None) or []:
+                    call_index = getattr(raw_call, "index", None)
+                    if call_index is None:
+                        call_index = getattr(raw_call, "id", None) or len(partial_calls)
+                    state = partial_calls.setdefault(
+                        call_index,
+                        {"id": "", "name": "", "arguments": ""},
+                    )
+                    call_id = getattr(raw_call, "id", None)
+                    if isinstance(call_id, str) and call_id:
+                        state["id"] = call_id
+                    function = getattr(raw_call, "function", None)
+                    name = getattr(function, "name", None)
+                    if isinstance(name, str):
+                        state["name"] += name
+                    arguments = getattr(function, "arguments", None)
+                    if isinstance(arguments, str):
+                        state["arguments"] += arguments
+
+        tool_calls = [
+            ToolCallRequest(
+                id=state["id"] or f"stream-tool-call-{index}",
+                name=state["name"],
+                arguments=state["arguments"] or {},
+            )
+            for index, state in partial_calls.items()
+            if state["name"]
+        ]
+        content = "".join(content_parts) or None
+        self._debug(
+            "agent_stream_response "
+            f"finish_reason={finish_reason} content_length={len(content or '')} "
+            f"tool_calls={len(tool_calls)} "
+            f"content_preview={_debug_content_preview(content)!r}"
+        )
+        return ModelToolResponse(content=content, tool_calls=tool_calls)
 
     def _debug(self, message: str) -> None:
         if self.debug:

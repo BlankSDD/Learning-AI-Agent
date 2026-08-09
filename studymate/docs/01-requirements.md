@@ -88,6 +88,7 @@ studymate eval
 ~~~text
 /help
 /sources
+/trace
 /reset
 /quit
 ~~~
@@ -96,7 +97,7 @@ studymate eval
 
 第一版只保存当前 Session 的最近若干轮消息。
 
-系统不应默认把全部历史对话永久写入知识库。
+系统不应默认把全部历史对话永久写入知识库。Agent 问答可以写入本地 Trace 会话文件，用于排查与复盘；该文件不参与后续模型上下文，也不用于恢复 Session。
 
 ### FR-009 错误处理
 
@@ -128,4 +129,3 @@ studymate eval
 - API Key 只能从环境变量读取。
 - 日志不得打印完整 API Key。
 - 第一版只能读取明确配置的知识库目录。
-

@@ -84,15 +84,14 @@ def normalize_proxy(proxy: str | None) -> str | None:
 
 
 def resolve_proxy(proxy: str | None = None) -> str | None:
+    if proxy is not None:
+        return normalize_proxy(proxy)
     try:
         from dotenv import load_dotenv
 
         load_dotenv(override=False)
     except ImportError:
         pass
-    explicit = normalize_proxy(proxy)
-    if explicit:
-        return explicit
     for name in ("STUDYMATE_DOCS_PROXY", "HTTPS_PROXY", "HTTP_PROXY"):
         value = normalize_proxy(os.environ.get(name))
         if value:

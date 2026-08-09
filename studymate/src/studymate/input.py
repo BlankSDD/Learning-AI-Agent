@@ -4,7 +4,7 @@ import re
 
 from .models import CommandResult, Intent, IntentKind
 
-SUPPORTED_COMMANDS = {"help", "sources", "reset", "update", "quit"}
+SUPPORTED_COMMANDS = {"help", "sources", "trace", "reset", "update", "quit"}
 GOAL_MARKERS = (
     "想学习",
     "想学",

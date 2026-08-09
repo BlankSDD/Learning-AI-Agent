@@ -121,17 +121,11 @@ StudyMate：校验参数并执行本地工具
 
 模型负责“决定调用什么”；StudyMate 负责“真正执行什么”。
 
-### 问题：为什么第一阶段 Agent 使用非流式请求？
+### 问题：Agent 一定要使用非流式请求吗？
 
-回答结论：这不是 Agent 必须非流式，而是第一阶段的工程选择。
+回答结论：不一定。最初选择非流式，是为了先理解完整工具名称和参数的解析；当前 StudyMate 已经支持流式 Tool Calling。
 
-原生 Tool Calling 返回的工具名称和参数必须完整，才能安全执行。流式响应会把工具名称和参数拆成多个片段，需要额外拼接、校验和处理多个并行工具调用。
-
-因此第一阶段：
-
-- Agent 工具调用使用 `stream=false`。
-- 先把 Agent Loop 和工具执行跑通。
-- 后续可以让工具调用阶段非流式、最终答案阶段流式。
+流式模式会把工具名称和参数拆成多个增量，需要在 `llm.py` 中聚合后才能交给 `ToolRegistry` 校验和执行。当前 Huazi/NewAPI + Claude 网关使用流式兼容性更好，但 CLI 仍会在收到完整最终答案后一次性打印。
 
 ### 问题：为什么模型网关要支持 `tools` 和 `tool_calls`？
 
@@ -143,6 +137,22 @@ StudyMate：校验参数并执行本地工具
 如果网关只返回普通文本，程序无法可靠识别模型想调用哪个工具，也不能保证参数安全。因此当前 Agent 需要 OpenAI-compatible 的原生工具调用能力。
 
 普通模型对话可以正常工作，并不代表该网关已经支持 Tool Calling；两者是不同的接口能力。
+
+### 问题：Agent Loop 和 Agent Runtime 有什么区别？
+
+回答结论：Agent Loop 是一次任务中的循环逻辑；Agent Runtime 是承载并约束这个循环的整个运行系统。
+
+```text
+Agent Runtime
+  -> 模型适配、消息状态、工具注册、权限、预算、Trace、错误处理
+  -> Agent Loop
+       -> 决定下一步
+       -> 调用工具
+       -> 观察结果
+       -> 继续或停止
+```
+
+在 StudyMate 中，`AgentRunner.run()` 的多轮“模型 -> 工具 -> 观察 -> 模型”过程是 Agent Loop；`AgentRunner`、`ToolRegistry`、`OpenAIAnswerer`、引用校验、工具预算和 Trace 共同构成最小 Agent Runtime。
 
 ## 四、项目结构问答
 
@@ -199,7 +209,36 @@ ChatService 仍然负责命令、会话历史和最终展示；AgentRunner 负�
 
 旧的一次性 RAG 路径暂时保留，用于兼容现有测试和旧接口。等 Agent 版本稳定后，可以删除这条兼容路径，统一使用 AgentRunner。
 
-## 六、阶段结论
+## 六、运行时保护补充
+
+### 问题：为什么 Agent 会反复调用工具，不能只让模型自己停止吗？
+
+回答结论：不能只依赖模型提示词。模型可能检索到泛化但无关的片段，或者忽略“不要重复调用”的规则，持续请求同一个工具。运行时必须负责步数、工具预算和停止条件。
+
+StudyMate 当前采用以下保护：
+
+- `max_steps=5` 是总步骤上限。
+- 每个只读工具在一次任务中默认最多执行一次。
+- 空的 `search_knowledge` 结果直接返回“知识库证据不足”。
+- 模型再次请求已用尽预算的工具时，AgentRunner 不再继续工具循环，而是进入最终化。
+
+### 问题：为什么最终化时需要清理 Tool Calling 消息？
+
+回答结论：Huazi 的 NewAPI 后端会将 Claude 工具调用转为 Bedrock 的 `toolUse/toolResult` 块。若历史中仍有这些块，但下一次请求不含工具配置，Bedrock 会返回 `TOOL_CONFIG_MISSING`。
+
+因此最终化时，StudyMate 会保留原始用户问题，把工具观察结果转为普通文本上下文，再发起一个不带工具的最终回答请求。这是 Provider 兼容层的约束，不改变 AgentRunner、ToolRegistry 与工具的职责边界。
+
+## 七、Agent Trace 与问答记录
+
+### 问题：`/trace` 是不是历史记录？
+
+回答结论：不是。对话历史用于让模型理解当前会话上下文，会发送给模型；Agent Trace 是开发者观察一次运行的执行记录，不会发送给模型。
+
+Trace 会记录每一步的可用工具、模型请求的工具和参数、执行结果摘要、停止原因与耗时。当前实现会把原始问题、最终回答和 Trace 追加到 `traces/session-<id>.jsonl`，便于复盘；不会保存 API Key、HTTP 请求头或完整知识库原文。
+
+`/reset` 只清空内存对话历史，已经落盘的 Trace 不会被删除。程序也不会在下次启动时自动将 Trace 恢复为模型记忆。
+
+## 八、阶段结论
 
 StudyMate 第一阶段已经完成从固定 RAG Workflow 到最小 Agent Runtime 的迁移：
 

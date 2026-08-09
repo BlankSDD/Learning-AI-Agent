@@ -7,6 +7,7 @@ from .citations import validate_citations
 from .input import classify_input, parse_command
 from .llm import LLMRequestError
 from .models import Answer, ChatResponse, SearchResult
+from .trace import AgentTrace, TraceStore
 
 
 class ChatService:
@@ -19,6 +20,7 @@ class ChatService:
         top_k: int = 5,
         max_history: int = 10,
         update_handler: Callable[[list[str]], str] | None = None,
+        trace_store: TraceStore | None = None,
     ):
         self.search_index = search_index
         self.llm = llm
@@ -28,6 +30,10 @@ class ChatService:
         self.history: list[dict[str, str]] = []
         self.last_retrieved: list[SearchResult] = []
         self.update_handler = update_handler
+        self.trace_store = trace_store
+        self.last_trace: AgentTrace | None = None
+        self.last_trace_path = None
+        self.last_trace_write_error: str | None = None
 
     def handle(self, text: str) -> ChatResponse:
         stripped = text.strip()
@@ -99,6 +105,7 @@ class ChatService:
             )
             answer = result.answer
             evidence = result.retrieved
+            trace = result.trace
         except (AgentRunError, LLMRequestError) as exc:
             answer = Answer(
                 answer=f"AI Agent 调用失败：{exc}",
@@ -108,8 +115,11 @@ class ChatService:
                 next_steps=["检查模型是否支持原生 Tool Calling", "稍后重试"],
             )
             evidence = []
+            trace = AgentTrace()
+            trace.finish("agent_error", error=str(exc))
 
         self.last_retrieved = evidence
+        self.last_trace = trace
         self.history.extend(
             [
                 {"role": "user", "content": stripped},
@@ -117,6 +127,7 @@ class ChatService:
             ]
         )
         self.history = self.history[-self.max_history :]
+        self._persist_agent_turn(stripped, answer, trace)
         return ChatResponse(
             answer=answer,
             history=list(self.history),
@@ -131,6 +142,9 @@ class ChatService:
         if command.name == "reset":
             self.history.clear()
             self.last_retrieved = []
+            self.last_trace = None
+            self.last_trace_path = None
+            self.last_trace_write_error = None
             return ChatResponse(command=command, history=[])
 
         if command.name == "sources":
@@ -150,10 +164,23 @@ class ChatService:
 
         if command.name == "help":
             answer = Answer(
-                answer="/sources 查看来源，/reset 重置会话，/update 更新文档，/quit 退出。",
+                answer=(
+                    "/sources 查看来源，/trace 查看上一轮 Agent 执行轨迹，"
+                    "/reset 重置会话，/update 更新文档，/quit 退出。"
+                ),
                 citations=[],
                 confidence=1.0,
                 need_more_context=False,
+                next_steps=[],
+            )
+            return ChatResponse(answer=answer, command=command, history=list(self.history))
+
+        if command.name == "trace":
+            answer = Answer(
+                answer=self._format_trace(),
+                citations=[],
+                confidence=1.0,
+                need_more_context=self.last_trace is None,
                 next_steps=[],
             )
             return ChatResponse(answer=answer, command=command, history=list(self.history))
@@ -187,4 +214,33 @@ class ChatService:
                 f"- {chunk.path}:{chunk.start_line}-{chunk.end_line} "
                 f"(score={result.score:.3f})"
             )
+        return "\n".join(lines)
+
+    def _persist_agent_turn(
+        self,
+        user_input: str,
+        answer: Answer,
+        trace: AgentTrace,
+    ) -> None:
+        self.last_trace_path = None
+        self.last_trace_write_error = None
+        if self.trace_store is None:
+            return
+        try:
+            self.last_trace_path = self.trace_store.append_turn(
+                user_input=user_input,
+                answer=answer.model_dump(mode="json"),
+                trace=trace,
+            )
+        except OSError as exc:
+            self.last_trace_write_error = str(exc)
+
+    def _format_trace(self) -> str:
+        if self.last_trace is None:
+            return "当前会话还没有可展示的 Agent Trace。"
+        lines = [self.last_trace.format_summary()]
+        if self.last_trace_path is not None:
+            lines.append(f"已落盘：{self.last_trace_path}")
+        if self.last_trace_write_error:
+            lines.append(f"Trace 落盘失败：{self.last_trace_write_error}")
         return "\n".join(lines)

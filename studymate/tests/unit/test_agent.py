@@ -68,7 +68,17 @@ def test_agent_calls_search_then_returns_grounded_answer(tmp_path):
     assert result.answer.citations[0].chunk_id == chunks[0].id
     assert result.retrieved[0].chunk.id == chunks[0].id
     assert result.steps == 2
+    assert result.trace.stop_reason == "final_answer"
+    assert result.trace.steps[0].requested_tools[0]["name"] == "search_knowledge"
+    assert result.trace.steps[0].executions[0]["evidence_count"] == 1
     assert model.calls[1]["messages"][-1]["role"] == "tool"
+    assert {tool["function"]["name"] for tool in model.calls[0]["tools"]} == {
+        "search_knowledge",
+        "open_document",
+    }
+    assert [tool["function"]["name"] for tool in model.calls[1]["tools"]] == [
+        "open_document"
+    ]
 
 
 def test_agent_can_call_open_document_after_search(tmp_path):
@@ -100,7 +110,43 @@ def test_agent_can_call_open_document_after_search(tmp_path):
 
     assert result.steps == 3
     assert result.tool_calls == ["search_knowledge", "open_document"]
-    assert model.calls[2]["messages"][-1]["role"] == "tool"
+    assert model.calls[2]["tools"] == []
+    assert model.calls[2]["messages"][-1]["role"] == "user"
+
+
+def test_agent_finalization_removes_tool_messages(tmp_path):
+    search_call = ModelToolResponse(
+        tool_calls=[
+            ToolCallRequest(
+                id="call-search",
+                name="search_knowledge",
+                arguments={"query": "RAG"},
+            )
+        ]
+    )
+    open_call = ModelToolResponse(
+        tool_calls=[
+            ToolCallRequest(
+                id="call-open",
+                name="open_document",
+                arguments={"path": "rag.md", "start_line": 1, "end_line": 3},
+            )
+        ]
+    )
+    runner, model, chunks = build_runner(
+        tmp_path,
+        [search_call, open_call, final_response("")],
+    )
+    model.responses[2] = final_response(chunks[0].id)
+
+    result = runner.run(user_input="Explain RAG")
+
+    assert result.answer.answer.startswith("RAG retrieves")
+    final_call = model.calls[2]
+    assert final_call["tools"] == []
+    assert all(message["role"] != "tool" for message in final_call["messages"])
+    assert all("tool_calls" not in message for message in final_call["messages"])
+    assert "Tool observations:" in final_call["messages"][-1]["content"]
 
 
 def test_agent_stops_after_max_steps(tmp_path):
@@ -120,6 +166,60 @@ def test_agent_stops_after_max_steps(tmp_path):
     assert result.steps == 3
     assert result.answer.confidence == 0.0
     assert "超过限制" in result.answer.answer
+
+
+def test_agent_stops_after_an_empty_knowledge_search(tmp_path):
+    no_result_search = ModelToolResponse(
+        tool_calls=[
+            ToolCallRequest(
+                id="call-search",
+                name="search_knowledge",
+                arguments={"query": "unmatched-agent-term"},
+            )
+        ]
+    )
+    runner, model, _ = build_runner(tmp_path, [no_result_search])
+
+    result = runner.run(user_input="What is an unmatched agent term?")
+
+    assert result.steps == 1
+    assert result.tool_calls == ["search_knowledge"]
+    assert result.retrieved == []
+    assert result.answer.need_more_context is True
+    assert "没有找到" in result.answer.answer
+    assert len(model.calls) == 1
+
+
+def test_agent_forces_finalization_after_a_repeated_tool_request(tmp_path):
+    search_call = ModelToolResponse(
+        tool_calls=[
+            ToolCallRequest(
+                id="call-search",
+                name="search_knowledge",
+                arguments={"query": "RAG"},
+            )
+        ]
+    )
+    repeated_search = ModelToolResponse(
+        tool_calls=[
+            ToolCallRequest(
+                id="call-search-again",
+                name="search_knowledge",
+                arguments={"query": "RAG"},
+            )
+        ]
+    )
+    runner, model, chunks = build_runner(
+        tmp_path,
+        [search_call, repeated_search, final_response("")],
+    )
+    model.responses[2] = final_response(chunks[0].id)
+
+    result = runner.run(user_input="Explain RAG")
+
+    assert result.answer.answer.startswith("RAG retrieves")
+    assert result.steps == 3
+    assert model.calls[2]["tools"] == []
 
 
 def test_agent_can_recover_from_unknown_tool(tmp_path):
