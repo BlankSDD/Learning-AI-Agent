@@ -383,6 +383,84 @@ class OpenAIAnswerer:
                 "请重试或检查模型是否支持 JSON 输出。"
             ) from exc
 
+    def chat_with_tools(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ):
+        """Make one native Tool Calling request for the StudyMate Agent."""
+        from .agent import ModelToolResponse, ToolCallRequest
+
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise RuntimeError(
+                "The openai package is not installed. Install the project dependencies first."
+            ) from exc
+
+        client_kwargs: dict[str, Any] = {"api_key": self.api_key}
+        if self.base_url:
+            client_kwargs["base_url"] = self.base_url
+        request_headers = dict(self.extra_headers)
+        if self.user_agent:
+            request_headers["User-Agent"] = self.user_agent
+        if request_headers:
+            client_kwargs["default_headers"] = request_headers
+        endpoint = (
+            f"{self.base_url.rstrip('/')}/chat/completions"
+            if self.base_url
+            else "/chat/completions"
+        )
+        self._debug(
+            f"agent_request={endpoint} provider={self.provider} model={self.model} "
+            f"message_count={len(messages)} tool_count={len(tools)} stream=false"
+        )
+        try:
+            client = OpenAI(**client_kwargs)
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=0.2,
+                stream=False,
+            )
+            message = response.choices[0].message
+            tool_calls: list[ToolCallRequest] = []
+            for index, call in enumerate(message.tool_calls or []):
+                raw_arguments = call.function.arguments or "{}"
+                if isinstance(raw_arguments, str):
+                    try:
+                        arguments: dict[str, Any] | str = json.loads(raw_arguments)
+                    except json.JSONDecodeError:
+                        arguments = raw_arguments
+                else:
+                    arguments = raw_arguments
+                tool_calls.append(
+                    ToolCallRequest(
+                        id=call.id or f"tool-call-{index}",
+                        name=call.function.name,
+                        arguments=arguments,
+                    )
+                )
+            return ModelToolResponse(
+                content=message.content,
+                tool_calls=tool_calls,
+            )
+        except Exception as exc:
+            self._debug(
+                f"agent_response_error type={type(exc).__name__} "
+                f"status={getattr(exc, 'status_code', None)} "
+                f"details={_safe_error_details(exc)}"
+            )
+            endpoint = self.base_url or "默认 OpenAI 接口"
+            message = describe_llm_error(exc)
+            raise LLMRequestError(
+                f"{message} 当前配置：provider={self.provider}，"
+                f"base_url={endpoint}，model={self.model}。"
+            ) from exc
+
     def _debug(self, message: str) -> None:
         if self.debug:
             print(f"[StudyMate debug] {message}", file=sys.stderr)

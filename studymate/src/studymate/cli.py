@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .agent import AgentRunner
 from .chat import ChatService
 from .docs_updater import DocsUpdateError, update_sources
 from .ingest import chunk_document, load_documents
 from .llm import OpenAIAnswerer
 from .search import InMemorySearchIndex
+from .tools import KnowledgeTools, build_knowledge_tool_registry
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -103,6 +105,13 @@ def run_chat(
     if not chunks:
         raise RuntimeError(f"No Markdown or TXT knowledge files found in {knowledge_dir}")
 
+    search_index = InMemorySearchIndex(chunks)
+    knowledge_tools = KnowledgeTools(knowledge_dir, search_index)
+    agent = AgentRunner(
+        llm=OpenAIAnswerer(),
+        tool_registry=build_knowledge_tool_registry(knowledge_tools),
+    )
+
     def refresh_index() -> None:
         refreshed_documents = load_documents(knowledge_dir)
         refreshed_chunks = [
@@ -111,6 +120,7 @@ def run_chat(
             for chunk in chunk_document(document)
         ]
         service.search_index = InMemorySearchIndex(refreshed_chunks)
+        knowledge_tools.search_index = service.search_index
         service.last_retrieved = []
 
     def update_handler(only: list[str]) -> str:
@@ -125,8 +135,9 @@ def run_chat(
         return report.format()
 
     service = ChatService(
-        search_index=InMemorySearchIndex(chunks),
-        llm=OpenAIAnswerer(),
+        search_index=search_index,
+        llm=agent.llm,
+        agent=agent,
         top_k=top_k,
         update_handler=update_handler,
     )

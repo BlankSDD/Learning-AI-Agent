@@ -212,26 +212,29 @@ STUDYMATE_API_KEY=填写你的 DeepSeek API Key
 - /help、/sources、/reset、/quit 命令。
 - OpenAI 兼容模型调用适配。
 - 自动更新 Claude Code、OpenCode、Codex 官方 Markdown 文档。
+- 第一阶段最小 Agent Runtime。
+- 原生 Tool Calling 和工具结果回传。
+- `search_knowledge`、`open_document` 两个只读工具。
 
 当前搜索基线是本地内存关键词检索。后续根据评估结果再升级 SQLite FTS5、Embedding 或混合检索。
 
 ## 7. 当前问答实现
 
-StudyMate 当前采用：
+StudyMate 的 CLI 当前采用：
 
 ~~~text
-本地知识库读取
-  -> 文档切分
-  -> 本地关键词检索 Top-K
-  -> 拼接相关知识片段和短期历史
-  -> 一次性调用 AI 模型
-  -> 解析结构化回答
+用户问题
+  -> AgentRunner
+  -> 模型决定是否调用工具
+  -> ToolRegistry 校验并执行工具
+  -> 工具结果作为观察消息返回模型
+  -> 模型继续调用工具或生成最终 Answer
   -> 校验引用并显示答案
 ~~~
 
 ### 7.1 是否流式
 
-NewAPI 配置默认使用流式请求。StudyMate 会接收完整的流式片段，在本地聚合 JSON 后一次性打印结构化答案；因此当前 CMD 还不会逐字显示生成过程。
+普通 RAG 兼容路径支持 NewAPI 流式请求。第一阶段 Agent 请求暂时强制使用非流式模式，确保 Tool Calling 的完整消息和参数可以可靠解析；当前 CMD 仍会一次性打印结构化答案。
 
 对应代码：
 
@@ -255,7 +258,7 @@ NewAPI 配置默认使用流式请求。StudyMate 会接收完整的流式片段
 
 ### 7.3 检索和模型的边界
 
-每次提问都会使用“当前问题”进行本地关键词检索，默认取 Top 5 片段。历史会发送给模型帮助理解“它”“上一个问题”等指代，但当前不会使用历史改写检索问题。
+Agent 不再由 `ChatService` 固定执行检索，而是把 `search_knowledge` 暴露给模型，由模型根据问题自主决定是否检索。历史会发送给模型帮助理解“它”“上一个问题”等指代，但当前不会使用历史改写检索问题。
 
 如果没有检索到证据，StudyMate 会直接返回“知识库中没有足够依据”，不会调用模型。检索到证据后，模型只能基于传入片段生成回答。
 
@@ -266,7 +269,9 @@ NewAPI 配置默认使用流式请求。StudyMate 会接收完整的流式片段
 | 能力 | 当前状态 |
 | --- | --- |
 | 本地 Markdown/TXT 检索 | 已实现 |
-| AI 模型生成回答 | 已实现，NewAPI 默认流式请求并在本地聚合 |
+| AI 模型生成回答 | 已实现；普通路径支持流式，Agent 路径暂时非流式 |
+| Agent 工具调用循环 | 已实现，最多 5 步 |
+| Agent 工具注册和参数校验 | 已实现 |
 | 当前会话短期历史 | 已实现，仅内存保存 |
 | 历史持久化 | 尚未实现 |
 | 基于历史改写检索 | 尚未实现 |
@@ -292,8 +297,9 @@ NewAPI 配置默认使用流式请求。StudyMate 会接收完整的流式片段
 | 2026-08-02 | NewAPI 请求兼容 | `src/studymate/llm.py`、`.env`、`tests/contract/test_llm_contract.py` | NewAPI 默认不发送 `response_format`，兼容 Claude 上游；增加代码块 JSON 解析；测试结果为 `28 passed`。 |
 | 2026-08-02 | Cherry Studio / Huazi 请求兼容 | `src/studymate/llm.py`、`.env`、`.env.example`、`tests/contract/test_llm_contract.py` | 对齐 Cherry Studio 的 `/v1`、额外 headers、流式请求和 `ai-sdk/openai-compatible/2.0.37` User-Agent；定位并修复 Huazi Cloudflare 拦截 `OpenAI/Python` 导致的 403；测试结果为 `29 passed`（另有 3 个受本机 pytest 临时目录权限影响的用例未执行）。 |
 | 2026-08-02 | Claude 引用格式兼容 | `src/studymate/llm.py`、`tests/contract/test_llm_contract.py` | 将模型返回的已检索 `chunk_id` 字符串补全为可审计引用对象；非法响应转换为可读错误，不再导致 CLI 堆栈退出；真实 CMD 问答验证通过。 |
+| 2026-08-07 | 第一阶段最小 Agent | `src/studymate/agent.py`、`src/studymate/tool_registry.py`、`src/studymate/tools.py`、`src/studymate/llm.py` | 增加有步数上限的 Agent Loop、原生 Tool Calling、知识库搜索和安全文档读取工具；新增 Agent 和工具 TDD 用例。 |
 
-当前待办方向：先补充 CMD 增量显示和历史持久化，再根据检索评估结果升级 Embedding 或混合检索。
+当前待办方向：先验证不同模型网关的原生 Tool Calling 兼容性，再增加 Agent 执行轨迹和评估数据；之后再做历史持久化、Embedding 或混合检索。
 
 ## 9. 开发流程
 
@@ -308,3 +314,69 @@ NewAPI 配置默认使用流式请求。StudyMate 会接收完整的流式片段
 ~~~powershell
 py -m pytest
 ~~~
+
+## 10. 第一阶段最小 Agent
+
+StudyMate 当前已经从固定 RAG Workflow 增量升级为一个最小 Agent。它不是通用 Agent 框架，而是面向本地知识库学习场景的 Agent Runtime。
+
+第一阶段只开放两个只读工具：
+
+- `search_knowledge`：检索本地知识库，返回片段和来源。
+- `open_document`：打开知识库内的指定文档或行范围。
+
+Agent 会根据用户问题自主决定是否调用工具。工具执行由 `ToolRegistry` 完成，模型不能直接执行 Python、Shell 或文件系统操作。
+
+### 10.1 Agent 运行流程
+
+```mermaid
+flowchart TD
+    A[用户问题] --> B[ChatService]
+    B --> C[AgentRunner]
+    C --> D[模型决定下一步]
+    D --> E{调用工具?}
+    E -- 否 --> F[解析最终 JSON 答案]
+    E -- 是 --> G[ToolRegistry 校验工具和参数]
+    G --> H{校验通过?}
+    H -- 否 --> I[返回工具错误观察结果]
+    H -- 是 --> J[执行 search_knowledge 或 open_document]
+    J --> K[追加工具结果]
+    I --> K
+    K --> L{未超过 5 步?}
+    L -- 是 --> D
+    L -- 否 --> M[安全停止]
+    F --> N[校验引用并输出来源]
+    M --> N
+```
+
+### 10.2 代码位置
+
+- `src/studymate/agent.py`：Agent 状态和循环。
+- `src/studymate/tool_registry.py`：工具注册、Schema、参数校验和分发。
+- `src/studymate/tools.py`：知识库工具实现和路径安全校验。
+- `src/studymate/llm.py`：OpenAI-compatible 原生 Tool Calling 请求。
+- `tests/unit/test_agent.py`：Agent Loop、连续调用和最大步数测试。
+- `tests/unit/test_tools.py`：工具输出、参数错误和路径穿越测试。
+
+第一阶段 Agent 请求使用非流式模式，要求当前模型网关支持 OpenAI-compatible `tools` 和 `tool_calls`。原有普通 RAG 问答仍保留兼容接口。
+
+详细设计见：
+
+- `docs/07-agent-scope.md`
+- `docs/08-tool-contracts.md`
+- `docs/09-agent-loop.md`
+
+### 10.3 Agent 实际消息流程
+
+```text
+用户问题
+  -> 模型返回 search_knowledge 工具调用
+  -> StudyMate 执行本地关键词检索
+  -> 检索结果作为 tool message 返回模型
+  -> 模型生成带引用的最终 Answer
+```
+
+### 10.4 学习记录
+
+知识问答、项目决策和阶段复盘保存在 `docs/learning-log/`。当前记录：
+
+- [2026-08-09 Agent 基础与 StudyMate 第一阶段](docs/learning-log/2026-08-09-agent-foundations.md)

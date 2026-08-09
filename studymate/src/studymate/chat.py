@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from .agent import AgentRunError, AgentRunner
 from .citations import validate_citations
 from .input import classify_input, parse_command
 from .llm import LLMRequestError
@@ -14,12 +15,14 @@ class ChatService:
         *,
         search_index,
         llm,
+        agent: AgentRunner | None = None,
         top_k: int = 5,
         max_history: int = 10,
         update_handler: Callable[[list[str]], str] | None = None,
     ):
         self.search_index = search_index
         self.llm = llm
+        self.agent = agent
         self.top_k = top_k
         self.max_history = max_history
         self.history: list[dict[str, str]] = []
@@ -30,6 +33,9 @@ class ChatService:
         stripped = text.strip()
         if stripped.startswith("/"):
             return self._handle_command(stripped)
+
+        if self.agent is not None:
+            return self._handle_agent(stripped)
 
         intent = classify_input(stripped)
         evidence = self.search_index.search(stripped, top_k=self.top_k)
@@ -71,6 +77,39 @@ class ChatService:
                     next_steps=["检查知识库来源", "重新提问"],
                 )
 
+        self.history.extend(
+            [
+                {"role": "user", "content": stripped},
+                {"role": "assistant", "content": answer.answer},
+            ]
+        )
+        self.history = self.history[-self.max_history :]
+        return ChatResponse(
+            answer=answer,
+            history=list(self.history),
+            retrieved=evidence,
+        )
+
+    def _handle_agent(self, stripped: str) -> ChatResponse:
+        intent = classify_input(stripped)
+        try:
+            result = self.agent.run(
+                user_input=f"[{intent.kind.value}] {stripped}",
+                history=list(self.history),
+            )
+            answer = result.answer
+            evidence = result.retrieved
+        except (AgentRunError, LLMRequestError) as exc:
+            answer = Answer(
+                answer=f"AI Agent 调用失败：{exc}",
+                citations=[],
+                confidence=0.0,
+                need_more_context=False,
+                next_steps=["检查模型是否支持原生 Tool Calling", "稍后重试"],
+            )
+            evidence = []
+
+        self.last_retrieved = evidence
         self.history.extend(
             [
                 {"role": "user", "content": stripped},

@@ -58,18 +58,21 @@ handle_input
   -> render result
 ~~~
 
-## 5. 后续 Agent 扩展
+## 5. 第一阶段 Agent Runtime
 
-第一版不实现自主循环。后续可以在 Application 层增加：
+当前 Application 层已经增加最小 Agent Runtime：
 
 ~~~text
-Agent Loop
-  -> decide next action
-  -> call search_notes / get_source / make_plan
-  -> observe tool result
-  -> decide whether to continue
-  -> answer
+AgentRunner
+  -> send messages and tool schemas to LLM
+  -> receive final answer or tool calls
+  -> validate tool name and arguments
+  -> execute registered tool
+  -> append tool result as observation
+  -> repeat until final answer or max steps
 ~~~
+
+`AgentRunner` 不执行任意代码。所有模型可见能力必须先注册到 `ToolRegistry`，第一阶段只注册 `search_knowledge` 和 `open_document`。
 
 Domain 层不应直接依赖具体模型 SDK、CLI 框架或向量数据库。
 
@@ -81,3 +84,27 @@ Domain 层不应直接依赖具体模型 SDK、CLI 框架或向量数据库。
 - Chat Service 负责业务流程。
 - CLI 只负责输入和展示。
 
+## 7. 运行流程图
+
+```mermaid
+flowchart TD
+    A[用户在 CMD 输入问题] --> B[ChatService]
+    B --> C[AgentRunner]
+    C --> D[调用模型并提供工具 Schema]
+    D --> E{模型是否请求工具}
+    E -- 否 --> F[解析最终 Answer]
+    E -- 是 --> G[ToolRegistry 校验名称和参数]
+    G --> H{工具是否安全有效}
+    H -- 否 --> I[生成工具错误观察结果]
+    H -- 是 --> J[执行知识库工具]
+    J --> K[返回检索片段或文档内容]
+    I --> L[把观察结果追加到消息]
+    K --> L
+    L --> M{是否超过最大步数}
+    M -- 否 --> D
+    M -- 是 --> N[安全停止并返回限制提示]
+    F --> O[校验引用]
+    O --> P[保存当前会话历史]
+    P --> Q[CLI 输出答案和来源]
+    N --> P
+```
