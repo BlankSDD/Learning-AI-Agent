@@ -30,3 +30,23 @@ def test_chunk_document_keeps_source_location():
     assert all(chunk.start_line >= 1 for chunk in chunks)
     assert all(chunk.end_line >= chunk.start_line for chunk in chunks)
 
+
+def test_chunk_document_keeps_correct_line_numbers_for_many_chunks():
+    text = "".join(f"line {index:05d} content for chunking\n" for index in range(1, 2_001))
+    document = Document(
+        id="doc-large",
+        path="large.md",
+        title="Large document",
+        content_hash="hash-large",
+        text=text,
+    )
+
+    chunks = chunk_document(document, max_chars=80, overlap=0)
+
+    assert len(chunks) > 100
+    assert chunks[0].start_line == 1
+    assert chunks[-1].end_line == 2_001
+    assert all(
+        previous.start_line <= current.start_line
+        for previous, current in zip(chunks, chunks[1:])
+    )

@@ -17,3 +17,4 @@
 1. [学习路线与每日任务](00-learning-roadmap.md)
 2. [2026-08-09 Agent 基础与 StudyMate 第一阶段](2026-08-09-agent-foundations.md)
 3. [2026-08-10 Agent 可观测性与评估](2026-08-10-agent-observability-and-evaluation.md)
+4. [2026-08-16 第一阶段复盘与第二阶段计划](2026-08-16-phase-one-review-and-phase-two-plan.md)

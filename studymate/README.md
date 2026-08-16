@@ -140,6 +140,30 @@ py -m studymate chat --trace-dir .\my-traces
 
 对话中输入 `/trace` 可查看上一轮的工具调用、工具结果摘要、停止原因和耗时。Trace 不会作为上下文再次发送给模型。
 
+### 3.1 运行 Agent Evaluation
+
+`Trace` 记录 Agent 做了什么，`Evaluation` 判断这次执行是否符合预期。Evaluation 不参与当前任务的循环控制；AgentRunner 先根据工具预算、空检索和最大步数结束任务，Evaluation 再检查停止原因、工具调用、检索来源、引用、关键词和拒答行为。
+
+默认评测数据位于 `tests/eval/questions.jsonl`，每行一个 JSON 对象。评测报告会写入 `evals/latest.json`，并且不会提交 Git：
+
+~~~powershell
+py -m studymate eval --knowledge .\\knowledge `
+  --dataset .\\tests\\eval\\questions.jsonl `
+  --output .\\evals\\latest.json
+~~~
+
+评测数据支持以下字段：
+
+- `id`、`input`：测试用例标识和用户问题。
+- `intent`：可选的 `question`、`goal` 或 `keyword`，会作为 Agent 输入前缀。
+- `expected_sources`：期望检索和引用的文档路径；空列表表示期望没有来源。
+- `required_terms`：最终回答中必须出现的关键词。
+- `expected_tools`：期望按顺序调用的工具。
+- `expected_stop_reason`：例如 `final_answer`、`empty_search` 或 `max_steps`。
+- `should_abstain`：是否应该声明知识库证据不足。
+
+命令返回码为：全部用例通过返回 `0`，任意用例失败返回 `1`。每个用例的报告包含 `loop_completed`，因此可以直接发现 Agent 是否因为 `max_steps` 异常结束；这只是评测结果，不会在运行中替代 AgentRunner 的停止条件。
+
 ## 4. 自动更新在线开发文档
 
 文档源配置位于：
@@ -242,7 +266,7 @@ STUDYMATE_API_KEY=填写你的 DeepSeek API Key
 - 递归读取 Markdown / TXT 知识库。
 - 文档标题识别。
 - 文档切分。
-- 本地关键词检索。
+- 本地关键词检索，支持中英文领域词扩展以及标题/路径加权排序。
 - CLI 对话服务。
 - 问题、学习目标、关键词输入分类。
 - 回答来源校验。
@@ -253,8 +277,9 @@ STUDYMATE_API_KEY=填写你的 DeepSeek API Key
 - 原生 Tool Calling 和工具结果回传。
 - `search_knowledge`、`open_document` 两个只读工具。
 - Agent Trace、`/trace` 和按会话 JSONL 问答记录。
+- Agent Evaluation、JSONL 评测数据和 JSON 汇总报告。
 
-当前搜索基线是本地内存关键词检索。后续根据评估结果再升级 SQLite FTS5、Embedding 或混合检索。
+当前搜索基线是本地内存关键词检索，已经加入中英文领域词扩展、查询停用词过滤以及标题/路径加权。后续根据评估结果再升级 SQLite FTS5、Embedding 或混合检索。
 
 ## 7. 当前问答实现
 
@@ -315,6 +340,7 @@ Agent 不再由 `ChatService` 固定执行检索，而是把 `search_knowledge` 
 | Agent 工具注册和参数校验 | 已实现 |
 | 当前会话短期历史 | 已实现，仅内存保存 |
 | Agent Trace 和问答落盘 | 已实现，按进程写入 `traces/session-*.jsonl`，不参与模型上下文 |
+| Agent Evaluation | 已实现，检查停止原因、工具、检索、引用、关键词和拒答行为 |
 | 跨进程恢复会话历史 | 尚未实现 |
 | 基于历史改写检索 | 尚未实现 |
 | Embedding/向量检索 | 尚未实现 |
@@ -344,6 +370,9 @@ Agent 不再由 `ChatService` 固定执行检索，而是把 `search_knowledge` 
 | 2026-08-09 | Agent 工具预算与最终化 | `src/studymate/agent.py`、`src/studymate/llm.py`、`tests/unit/test_agent.py`、`tests/contract/test_llm_contract.py` | 每个工具默认只允许调用一次；重复调用会切换到无工具最终化。为兼容 Bedrock，上述最终化会将工具结果转为普通上下文后再请求模型，避免 `TOOL_CONFIG_MISSING`；以 Huazi/Claude 真实问答验证不会再循环至步骤上限。 |
 | 2026-08-09 | Claude 最终 JSON 兼容 | `src/studymate/llm.py`、`tests/contract/test_llm_contract.py` | 响应解析器兼容 `confidence: "high"` 和 `next_steps: "单条建议"` 等常见变体，统一为内部 `Answer` 类型要求的数值和字符串列表。 |
 | 2026-08-09 | Agent Trace 与问答落盘 | `src/studymate/trace.py`、`src/studymate/agent.py`、`src/studymate/chat.py`、`src/studymate/cli.py`、`tests/unit/test_trace.py` | 每轮记录工具可用性、调用、结果摘要、停止原因和耗时；问题与回答追加到按会话分组的 JSONL。新增 `/trace` 查看上一轮，不将 Trace 传回模型。 |
+| 2026-08-16 | 可引用的文档读取证据 | `src/studymate/tools.py`、`tests/unit/test_tools.py` | `open_document` 为读取的行范围生成稳定 `chunk_id` 并回传证据，使打开的文档也能参与引用校验和 Evaluation。 |
+| 2026-08-16 | 中英文混合检索优化 | `src/studymate/search.py`、`tests/unit/test_search.py` | 增加领域词查询扩展、中文停用词过滤、匹配覆盖率以及标题/路径加权；修复 MCP 和“自定义工具”评测用例的召回问题。 |
+| 2026-08-16 | Agent Evaluation | `src/studymate/evaluation.py`、`src/studymate/cli.py`、`tests/eval/` | 增加 JSONL 评测数据加载、Agent 隔离执行、停止原因/循环完成、工具成功、检索来源、引用、关键词和拒答检查；增加 `eval` 命令和 `evals/latest.json` 报告。 |
 
 当前待办方向：先学习并实现 Agent Eval，再做查询规范化与检索评估；之后再评估 Embedding/混合检索、可控的跨进程记忆和 MCP。
 
@@ -434,3 +463,4 @@ flowchart TD
 - [学习路线与每日任务](docs/learning-log/00-learning-roadmap.md)
 - [2026-08-09 Agent 基础与 StudyMate 第一阶段](docs/learning-log/2026-08-09-agent-foundations.md)
 - [2026-08-10 Agent 可观测性与评估](docs/learning-log/2026-08-10-agent-observability-and-evaluation.md)
+- [2026-08-16 第一阶段复盘与第二阶段计划](docs/learning-log/2026-08-16-phase-one-review-and-phase-two-plan.md)

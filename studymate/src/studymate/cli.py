@@ -6,6 +6,7 @@ from pathlib import Path
 from .agent import AgentRunner
 from .chat import ChatService
 from .docs_updater import DocsUpdateError, update_sources
+from .evaluation import EvaluationDatasetError, EvaluationRunner, load_evaluation_dataset
 from .ingest import chunk_document, load_documents
 from .llm import OpenAIAnswerer
 from .search import InMemorySearchIndex
@@ -19,6 +20,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest = subparsers.add_parser("ingest", help="scan and validate knowledge files")
     ingest.add_argument("knowledge_dir", type=Path)
+
+    evaluation = subparsers.add_parser(
+        "eval", help="run the Agent against a JSONL evaluation dataset"
+    )
+    evaluation.add_argument(
+        "--knowledge",
+        type=Path,
+        default=Path("knowledge"),
+        help="knowledge directory used by the Agent",
+    )
+    evaluation.add_argument(
+        "--dataset",
+        type=Path,
+        default=Path("tests/eval/questions.jsonl"),
+        help="JSONL evaluation dataset",
+    )
+    evaluation.add_argument(
+        "--output",
+        type=Path,
+        default=Path("evals/latest.json"),
+        help="JSON report path",
+    )
 
     update = subparsers.add_parser("update-docs", help="download configured online documentation")
     update.add_argument(
@@ -74,6 +97,40 @@ def run_ingest(knowledge_dir: Path) -> int:
     for document in documents:
         print(f"- {document.path} ({document.title})")
     return 0
+
+
+def run_eval(*, knowledge_dir: Path, dataset_path: Path, output_path: Path) -> int:
+    try:
+        cases = load_evaluation_dataset(dataset_path)
+    except EvaluationDatasetError as exc:
+        print(f"Evaluation dataset error: {exc}")
+        return 1
+    if not cases:
+        print("Evaluation dataset is empty.")
+        return 1
+
+    documents = load_documents(knowledge_dir)
+    chunks = [chunk for document in documents for chunk in chunk_document(document)]
+    if not chunks:
+        print(f"No Markdown or TXT knowledge files found in {knowledge_dir}")
+        return 1
+
+    search_index = InMemorySearchIndex(chunks)
+    knowledge_tools = KnowledgeTools(knowledge_dir, search_index)
+    agent = AgentRunner(
+        llm=OpenAIAnswerer(),
+        tool_registry=build_knowledge_tool_registry(knowledge_tools),
+    )
+    report = EvaluationRunner(agent).run(cases, dataset=str(dataset_path))
+    try:
+        report_path = report.write_json(output_path)
+    except OSError as exc:
+        print(f"Cannot write evaluation report: {exc}")
+        return 1
+
+    print(report.format_summary())
+    print(f"Report: {report_path}")
+    return 0 if report.failed == 0 else 1
 
 
 def run_update_docs(
@@ -179,6 +236,12 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.command == "ingest":
         return run_ingest(args.knowledge_dir)
+    if args.command == "eval":
+        return run_eval(
+            knowledge_dir=args.knowledge,
+            dataset_path=args.dataset,
+            output_path=args.output,
+        )
     if args.command == "update-docs":
         return run_update_docs(
             knowledge_dir=args.knowledge,

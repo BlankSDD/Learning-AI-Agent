@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
 from .ingest import SUPPORTED_SUFFIXES
+from .models import Chunk, SearchResult
 from .search import InMemorySearchIndex
 from .tool_registry import ToolDefinition, ToolOutput, ToolRegistry
 
@@ -66,14 +68,29 @@ class KnowledgeTools:
         actual_end = min(actual_end, len(lines))
         selected = lines[start_line - 1 : actual_end]
         relative_path = document_path.relative_to(self.knowledge_root).as_posix()
+        selected_text = "\n".join(selected)
+        chunk_id = hashlib.sha1(
+            f"open:{relative_path}:{start_line}:{actual_end}:{selected_text}".encode("utf-8")
+        ).hexdigest()[:16]
+        opened_chunk = Chunk(
+            id=chunk_id,
+            document_id=hashlib.sha1(relative_path.encode("utf-8")).hexdigest()[:16],
+            path=relative_path,
+            title=_title_from_lines(document_path, lines),
+            text=selected_text,
+            start_line=start_line,
+            end_line=actual_end,
+        )
         return ToolOutput(
             payload={
                 "path": relative_path,
                 "title": _title_from_lines(document_path, lines),
                 "start_line": start_line,
                 "end_line": actual_end,
-                "text": "\n".join(selected),
-            }
+                "text": selected_text,
+                "chunk_id": chunk_id,
+            },
+            evidence=[SearchResult(chunk=opened_chunk, score=1.0)],
         )
 
     def _safe_document_path(self, path: str) -> Path:

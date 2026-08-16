@@ -37,6 +37,9 @@ def test_open_document_tool_reads_requested_lines(tmp_path):
     assert execution.is_error is False
     assert execution.payload["path"] == "rag.md"
     assert "# RAG" in execution.payload["text"]
+    assert execution.payload["chunk_id"] == execution.evidence[0].chunk.id
+    assert execution.evidence[0].chunk.start_line == 1
+    assert execution.evidence[0].chunk.end_line == 2
 
 
 def test_open_document_tool_rejects_path_escape(tmp_path):

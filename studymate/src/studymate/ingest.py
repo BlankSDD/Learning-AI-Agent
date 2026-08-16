@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from bisect import bisect_left
 from pathlib import Path
 
 from .models import Chunk, Document
@@ -79,6 +80,9 @@ def chunk_document(
 
     text = document.text
     chunks: list[Chunk] = []
+    # Line positions are shared by every chunk. Recounting from the beginning
+    # for each chunk makes large downloaded documentation unnecessarily slow.
+    newline_positions = [match.start() for match in re.finditer("\n", text)]
     start = 0
 
     while start < len(text):
@@ -90,8 +94,8 @@ def chunk_document(
 
         chunk_text = text[start:end].strip()
         if chunk_text:
-            start_line = text.count("\n", 0, start) + 1
-            end_line = text.count("\n", 0, end) + 1
+            start_line = bisect_left(newline_positions, start) + 1
+            end_line = bisect_left(newline_positions, end) + 1
             chunk_id = hashlib.sha1(
                 f"{document.id}:{start}:{end}:{chunk_text}".encode("utf-8")
             ).hexdigest()[:16]
@@ -119,4 +123,3 @@ def load_chunks(root: Path, **chunk_options: int) -> list[Chunk]:
     for document in load_documents(root):
         chunks.extend(chunk_document(document, **chunk_options))
     return chunks
-

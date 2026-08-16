@@ -3,4 +3,5 @@
 __pycache__/
 .pytest_cache/
 traces/
+evals/
 *.py[cod]
