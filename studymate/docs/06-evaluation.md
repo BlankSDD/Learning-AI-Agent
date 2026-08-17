@@ -20,15 +20,43 @@ py -m studymate eval `
   --output .\evals\latest.json
 ```
 
+检索指标默认使用 `K=5`，可以显式调整：
+
+```powershell
+py -m studymate eval --retrieval-k 5
+```
+
 命令会：
 
 1. 加载知识库和评测集。
 2. 每个用例使用空历史独立运行一次 Agent。
 3. 检查 Agent 是否完成、停止原因、工具调用和工具执行状态。
 4. 检查检索来源、回答引用、必需关键词和拒答状态。
-5. 将每道题的结果和汇总统计写入 JSON 报告。
+5. 计算每道题的检索、引用、拒答和延迟指标。
+6. 将每道题的结果和汇总统计写入 JSON 报告。
 
 全部用例通过返回退出码 `0`，否则返回 `1`，方便后续接入 CI。
+
+## 2.1 检索后端对比
+
+Agent Evaluation 用于判断完整 Agent 行为是否符合预期；如果只想观察不同检索算法的排名，可以运行：
+
+```powershell
+py -m studymate compare-search `
+  --knowledge .\knowledge `
+  --query "agent loop 和 agent runtime 有什么区别？" `
+  --query "What is MCP?" `
+  --output .\logs\search-comparison.jsonl
+```
+
+该命令会比较：
+
+- `memory`：内存 BM25 风格检索；
+- `sqlite`：SQLite FTS5/BM25；
+- `memory`：内存 BM25 风格检索；
+- `sqlite`：SQLite FTS5/BM25。
+
+分数只在同一后端内部比较。最终应结合目标来源是否进入 Top-K、排名、Hit@K、Recall@K、Precision@K、MRR 和人工相关性判断。Embedding 和 Reranker 暂不参与主流程，相关源码仅作为后续学习材料保留。
 
 ## 3. 评测集格式
 
@@ -77,7 +105,52 @@ py -m studymate eval `
 
 单个用例只有所有检查都通过才算通过。报告同时保留回答、引用、工具调用、完整 Trace、步骤数、停止原因和耗时，评测失败后可以直接从同一个 JSON 报告定位执行过程。
 
-## 5. 当前实现边界
+## 5. 检索质量指标
+
+每个成功执行的用例会在 `result.metrics` 中保存以下字段：
+
+| 指标 | 含义 |
+| --- | --- |
+| `hit_at_k` | 前 K 个来源中是否至少命中一个期望来源 |
+| `recall_at_k` | 前 K 个结果召回的期望来源数 / 期望来源总数 |
+| `precision_at_k` | 前 K 个结果中匹配期望来源的结果数 / 前 K 个结果数 |
+| `mrr` | 第一个期望来源排名的倒数，未命中为 0 |
+| `citation_accuracy` | 最终引用中匹配期望来源的引用比例 |
+| `citation_coverage` | 被最终回答引用的期望来源数 / 期望来源总数 |
+| `abstained` | Agent 是否声明证据不足 |
+| `abstention_correct` | 存在 `should_abstain` 时，实际拒答是否符合预期 |
+
+`summary.metrics` 会按以下口径汇总：
+
+- `hit_at_k` 和 `precision_at_k` 包含全部用例；无来源题在没有召回时算正确。
+- `recall_at_k`、`mrr` 和 `citation.coverage` 只统计 `expected_sources` 非空的正向用例。
+- `citation.accuracy`、`abstention.rate` 和延迟统计包含所有成功执行的用例。
+- 模型或工具异常的用例不会伪造检索指标，但仍会计入失败数量。
+
+报告结构示例：
+
+```json
+{
+  "schema_version": 2,
+  "summary": {
+    "total": 15,
+    "passed": 15,
+    "failed": 0,
+    "pass_rate": 1.0,
+    "metrics": {
+      "retrieval": {
+        "k": 5,
+        "hit_at_k": 1.0,
+        "recall_at_k": 1.0,
+        "precision_at_k": 0.8,
+        "mrr": 1.0
+      }
+    }
+  }
+}
+```
+
+## 6. 当前实现边界
 
 第一版是可重复的规则评测，不会使用另一个模型来评价答案语义。它适合先验证 Agent Runtime 的行为契约：是否调用工具、是否安全结束、是否引用正确来源、是否在无证据时拒答。
 
@@ -85,11 +158,10 @@ py -m studymate eval `
 
 - 人工标注的参考答案和答案正确性评分。
 - LLM-as-a-Judge，但需要固定 Prompt、模型和评分标准。
-- 检索 Recall、MRR、引用覆盖率等更细的 RAG 指标。
 - Token、费用和多轮延迟统计。
 - 将评测报告和版本号绑定，比较不同 Prompt 或检索策略的回归。
 
-## 6. 开发原则
+## 7. 开发原则
 
 - 成功和失败样本都要保留。
 - 每次修改 Prompt、工具契约或检索策略后重新运行评测。

@@ -5,11 +5,12 @@ from pathlib import Path
 
 from .agent import AgentRunner
 from .chat import ChatService
+from .comparison import run_search_comparison
 from .docs_updater import DocsUpdateError, update_sources
 from .evaluation import EvaluationDatasetError, EvaluationRunner, load_evaluation_dataset
 from .ingest import chunk_document, load_documents
 from .llm import OpenAIAnswerer
-from .search import InMemorySearchIndex
+from .search import build_search_index
 from .tools import KnowledgeTools, build_knowledge_tool_registry
 from .trace import TraceStore
 
@@ -41,6 +42,43 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("evals/latest.json"),
         help="JSON report path",
+    )
+    evaluation.add_argument(
+        "--retrieval-k",
+        type=int,
+        default=5,
+        help="K used for retrieval quality metrics",
+    )
+    _add_search_options(evaluation)
+
+    comparison = subparsers.add_parser(
+        "compare-search",
+        help="compare memory BM25 and SQLite FTS5/BM25",
+    )
+    comparison.add_argument(
+        "--knowledge",
+        type=Path,
+        default=Path("knowledge"),
+        help="knowledge directory used by the retrieval backends",
+    )
+    comparison.add_argument(
+        "--query",
+        action="append",
+        required=True,
+        help="query to compare; repeat this option for multiple queries",
+    )
+    comparison.add_argument("--top-k", type=int, default=5)
+    comparison.add_argument(
+        "--output",
+        type=Path,
+        default=Path("logs/search-comparison.jsonl"),
+        help="JSONL comparison log path",
+    )
+    comparison.add_argument(
+        "--search-db",
+        type=Path,
+        default=Path("data/studymate-search.sqlite3"),
+        help="SQLite FTS5 index file",
     )
 
     update = subparsers.add_parser("update-docs", help="download configured online documentation")
@@ -87,7 +125,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("traces"),
         help="directory receiving per-session question/answer/trace JSONL files",
     )
+    _add_search_options(chat)
     return parser
+
+
+def _add_search_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--search-backend",
+        choices=("memory", "sqlite"),
+        default="memory",
+        help="检索后端：memory BM25 风格索引或 sqlite FTS5/BM25",
+    )
+    parser.add_argument(
+        "--search-db",
+        type=Path,
+        default=Path("data/studymate-search.sqlite3"),
+        help="SQLite 检索库文件；仅 search-backend=sqlite 时使用",
+    )
 
 
 def run_ingest(knowledge_dir: Path) -> int:
@@ -99,7 +153,15 @@ def run_ingest(knowledge_dir: Path) -> int:
     return 0
 
 
-def run_eval(*, knowledge_dir: Path, dataset_path: Path, output_path: Path) -> int:
+def run_eval(
+    *,
+    knowledge_dir: Path,
+    dataset_path: Path,
+    output_path: Path,
+    retrieval_k: int = 5,
+    search_backend: str = "memory",
+    search_db: Path | None = None,
+) -> int:
     try:
         cases = load_evaluation_dataset(dataset_path)
     except EvaluationDatasetError as exc:
@@ -115,13 +177,19 @@ def run_eval(*, knowledge_dir: Path, dataset_path: Path, output_path: Path) -> i
         print(f"No Markdown or TXT knowledge files found in {knowledge_dir}")
         return 1
 
-    search_index = InMemorySearchIndex(chunks)
+    search_index = build_search_index(
+        chunks,
+        backend=search_backend,
+        database_path=search_db,
+    )
     knowledge_tools = KnowledgeTools(knowledge_dir, search_index)
     agent = AgentRunner(
         llm=OpenAIAnswerer(),
         tool_registry=build_knowledge_tool_registry(knowledge_tools),
     )
-    report = EvaluationRunner(agent).run(cases, dataset=str(dataset_path))
+    report = EvaluationRunner(agent, retrieval_k=retrieval_k).run(
+        cases, dataset=str(dataset_path)
+    )
     try:
         report_path = report.write_json(output_path)
     except OSError as exc:
@@ -158,19 +226,68 @@ def run_update_docs(
     return 1 if report.has_errors else 0
 
 
+def run_compare_search(
+    *,
+    knowledge_dir: Path,
+    queries: list[str],
+    output_path: Path,
+    top_k: int,
+    search_db: Path,
+) -> int:
+    documents = load_documents(knowledge_dir)
+    chunks = [chunk for document in documents for chunk in chunk_document(document)]
+    if not chunks:
+        print(f"No Markdown or TXT knowledge files found in {knowledge_dir}")
+        return 1
+
+    indexes = {}
+    setup_errors: dict[str, str] = {}
+    for name, backend in (("memory", "memory"), ("sqlite", "sqlite")):
+        try:
+            indexes[name] = build_search_index(
+                chunks,
+                backend=backend,
+                database_path=search_db,
+            )
+        except Exception as exc:
+            setup_errors[name] = f"{type(exc).__name__}: {exc}"
+
+    try:
+        written = run_search_comparison(
+            queries=queries,
+            indexes=indexes,
+            output_path=output_path,
+            top_k=top_k,
+            setup_errors=setup_errors,
+        )
+    finally:
+        for index in indexes.values():
+            close = getattr(index, "close", None)
+            if close is not None:
+                close()
+    print(f"Comparison log: {output_path}")
+    return 0 if written else 1
+
+
 def run_chat(
     knowledge_dir: Path,
     top_k: int,
     docs_config: Path,
     proxy: str | None,
     trace_dir: Path,
+    search_backend: str = "memory",
+    search_db: Path | None = None,
 ) -> int:
     documents = load_documents(knowledge_dir)
     chunks = [chunk for document in documents for chunk in chunk_document(document)]
     if not chunks:
         raise RuntimeError(f"No Markdown or TXT knowledge files found in {knowledge_dir}")
 
-    search_index = InMemorySearchIndex(chunks)
+    search_index = build_search_index(
+        chunks,
+        backend=search_backend,
+        database_path=search_db,
+    )
     knowledge_tools = KnowledgeTools(knowledge_dir, search_index)
     agent = AgentRunner(
         llm=OpenAIAnswerer(),
@@ -184,7 +301,15 @@ def run_chat(
             for document in refreshed_documents
             for chunk in chunk_document(document)
         ]
-        service.search_index = InMemorySearchIndex(refreshed_chunks)
+        old_index = service.search_index
+        close = getattr(old_index, "close", None)
+        if close is not None:
+            close()
+        service.search_index = build_search_index(
+            refreshed_chunks,
+            backend=search_backend,
+            database_path=search_db,
+        )
         knowledge_tools.search_index = service.search_index
         service.last_retrieved = []
 
@@ -207,7 +332,11 @@ def run_chat(
         update_handler=update_handler,
         trace_store=TraceStore(trace_dir),
     )
-    print(f"StudyMate loaded {len(documents)} documents. Type /help for commands.")
+    print(
+        f"StudyMate loaded {len(documents)} documents. "
+        f"Search backend: {search_backend}. "
+        "Type /help for commands."
+    )
     print(f"Trace records: {service.trace_store.path}")
     while True:
         try:
@@ -241,6 +370,17 @@ def main() -> int:
             knowledge_dir=args.knowledge,
             dataset_path=args.dataset,
             output_path=args.output,
+            retrieval_k=args.retrieval_k,
+            search_backend=args.search_backend,
+            search_db=args.search_db,
+        )
+    if args.command == "compare-search":
+        return run_compare_search(
+            knowledge_dir=args.knowledge,
+            queries=args.query,
+            output_path=args.output,
+            top_k=args.top_k,
+            search_db=args.search_db,
         )
     if args.command == "update-docs":
         return run_update_docs(
@@ -258,6 +398,8 @@ def main() -> int:
             args.docs_config,
             args.proxy,
             args.trace_dir,
+            args.search_backend,
+            args.search_db,
         )
     return 2
 

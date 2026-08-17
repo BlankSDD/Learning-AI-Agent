@@ -18,3 +18,5 @@
 2. [2026-08-09 Agent 基础与 StudyMate 第一阶段](2026-08-09-agent-foundations.md)
 3. [2026-08-10 Agent 可观测性与评估](2026-08-10-agent-observability-and-evaluation.md)
 4. [2026-08-16 第一阶段复盘与第二阶段计划](2026-08-16-phase-one-review-and-phase-two-plan.md)
+5. [2026-08-17 检索接口与 BM25 风格基线](2026-08-17-retrieval-interface-and-bm25-baseline.md)
+6. [2026-08-18 Embedding、Reranker 与检索结果对比](2026-08-18-embedding-reranker-and-comparison.md)

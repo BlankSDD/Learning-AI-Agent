@@ -4,4 +4,7 @@ __pycache__/
 .pytest_cache/
 traces/
 evals/
+data/
+logs/
+*.sqlite3
 *.py[cod]

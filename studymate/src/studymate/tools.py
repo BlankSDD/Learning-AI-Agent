@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from .ingest import SUPPORTED_SUFFIXES
 from .models import Chunk, SearchResult
-from .search import InMemorySearchIndex
+from .search import SearchIndex
 from .tool_registry import ToolDefinition, ToolOutput, ToolRegistry
 
 
@@ -30,7 +30,7 @@ class KnowledgeToolError(RuntimeError):
 class KnowledgeTools:
     """Read-only tools exposed to the StudyMate Agent."""
 
-    def __init__(self, knowledge_root: Path, search_index: InMemorySearchIndex):
+    def __init__(self, knowledge_root: Path, search_index: SearchIndex):
         self.knowledge_root = Path(knowledge_root).resolve()
         self.search_index = search_index
 

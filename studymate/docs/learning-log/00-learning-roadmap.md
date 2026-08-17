@@ -11,9 +11,12 @@
 - 当前进程内的短期对话历史。
 - Agent Trace、`/trace` 和问题/回答/执行轨迹的 JSONL 落盘。
 - Agent Evaluation、JSONL 评测集和 JSON 评测报告。
-- 中英文领域词查询扩展、停用词过滤以及标题/路径加权检索。
+- 中英文领域词查询扩展、停用词过滤、查询归一化、短语匹配以及标题/路径加权的 BM25 风格检索。
+- `SearchIndex` 可替换检索接口，已实现 `InMemorySearchIndex` 和 `SQLiteFTS5SearchIndex` 两个词法检索后端。
+- `compare-search` 检索对比日志，用于比较内存 BM25 风格检索与 SQLite FTS5/BM25。
+- 完整 pytest 已通过：`71 passed`；当前测试和主流程不调用 Embedding API。
 
-尚未完成的能力不应写进简历：BM25/SQLite FTS5 检索、Embedding/混合检索、完整检索指标、跨进程会话恢复、MCP Server 和 AI Coding Agent。
+尚未完成的能力不应写进简历：Embedding/向量检索、Reranker、混合检索、跨进程会话恢复、MCP Server 和 AI Coding Agent。
 
 ## 按顺序学习
 
@@ -53,22 +56,36 @@
 
 完成标准：为 `agentloop`、`agent runtime`、中文英文混合术语新增可重复的检索测试，且不会无故扩大召回范围。当前已完成基础规则扩展，仍需用更大评测集验证。
 
-### 第 4 天：RAG 检索质量（下一阶段）
+### 第 4 天：RAG 检索质量（检索基线已完成）
 
 目标：理解关键词检索、Embedding、向量检索、混合检索、重排序和引用校验各自解决什么问题。
 
-学习 `Hit@K`、Recall@K、Precision@K、MRR、BM25、Chunking 和 Reranker。先为当前关键词检索建立评估基线，再实现 SQLite FTS5/BM25；不要在没有评估基线时直接接向量数据库。
+已完成检索接口抽象、内存 BM25 风格基线、SQLite FTS5/BM25 后端和 `Hit@K`、Recall@K、Precision@K、MRR、Citation Accuracy/Coverage、Abstention Rate/Accuracy 指标。接下来使用 `compare-search` 观察两个词法后端的排名，再将结果纳入评测集。
 
-### 第 5 天以后：更完整的 Agent 能力
+### 明天：统一检索评测（2026-08-19）
+
+目标：不使用 Embedding，使用评测集比较内存 BM25 风格检索和 SQLite FTS5/BM25。
+
+学习和动手顺序：
+
+1. 阅读 `docs/06-evaluation.md` 和 `src/studymate/evaluation.py`，复习 Hit@K、Recall@K、Precision@K、MRR 和引用覆盖率。
+2. 运行 `compare-search`，比较同一问题在两个本地后端中的排名差异。
+3. 为中文、英文、CamelCase、文件名和 API 术语各补充可复现的检索问题。
+4. 检查目标来源是否真的能回答问题，修正评测集标注。
+5. 运行完整 pytest，记录检索调整对 Agent、Trace 和 Eval 的影响。
+
+完成标准：能够从指标和人工检查两方面说明检索失败原因，并且不产生 Embedding API 请求。
+
+### 下一阶段：本地 RAG 与 Agent 工程化
 
 按以下顺序扩展：
 
-1. RAG 检索质量：SQLite FTS5/BM25、检索指标、Chunking、Embedding 和 Reranker。
-2. 跨进程会话恢复与用户可控的记忆。
-3. 更多只读工具和工具权限模型。
-4. MCP：先做本地知识库工具的 MCP Server，再接入 MCP Client。
-5. AI Coding Agent：工作区扫描、文件检索、受控编辑、运行测试、Git Diff 审查。
-6. LangGraph、OpenCode SDK 等框架对比。此时再把自己写的 Runtime 与框架能力逐项对照。
+1. 调整 Chunk 和词法检索参数，用评测集建立本地 RAG 基线。
+2. 完善引用校验、证据不足时的拒答和 Trace 诊断。
+3. 实现跨进程会话恢复与用户可控的记忆。
+4. 将本地知识库工具包装成只读 MCP Server，再接入 MCP Client。
+5. 在隔离工作区实现 AI Coding Agent 的文件扫描、受控编辑、测试运行和 Git Diff 审查。
+6. 最后再对比 Embedding、向量数据库、混合检索、Reranker、LangGraph 和 OpenCode SDK；在没有评测证据前不启用这些额外依赖。
 
 ## 每次学习的固定闭环
 

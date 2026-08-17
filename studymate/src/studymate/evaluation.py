@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,6 +81,7 @@ class EvaluationCaseResult:
     retrieved_sources: list[str] = field(default_factory=list)
     trace: dict[str, Any] | None = None
     error: str | None = None
+    metrics: "EvaluationCaseMetrics | None" = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +98,35 @@ class EvaluationCaseResult:
             "retrieved_sources": self.retrieved_sources,
             "trace": self.trace,
             "error": self.error,
+            "metrics": self.metrics.to_dict() if self.metrics is not None else None,
+        }
+
+
+@dataclass(frozen=True)
+class EvaluationCaseMetrics:
+    """Retrieval and answer quality metrics for one evaluation case."""
+
+    retrieval_k: int
+    hit_at_k: bool
+    recall_at_k: float
+    precision_at_k: float
+    mrr: float
+    citation_accuracy: float
+    citation_coverage: float
+    abstained: bool
+    abstention_correct: bool | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "retrieval_k": self.retrieval_k,
+            "hit_at_k": self.hit_at_k,
+            "recall_at_k": self.recall_at_k,
+            "precision_at_k": self.precision_at_k,
+            "mrr": self.mrr,
+            "citation_accuracy": self.citation_accuracy,
+            "citation_coverage": self.citation_coverage,
+            "abstained": self.abstained,
+            "abstention_correct": self.abstention_correct,
         }
 
 
@@ -104,6 +135,7 @@ class EvaluationReport:
     dataset: str
     results: list[EvaluationCaseResult]
     duration_ms: int
+    retrieval_k: int = 5
     generated_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="milliseconds")
     )
@@ -122,9 +154,61 @@ class EvaluationReport:
             return 0.0
         return self.passed / len(self.results)
 
+    @property
+    def metrics(self) -> dict[str, Any]:
+        evaluated = [result for result in self.results if result.metrics is not None]
+        positive = [result for result in evaluated if result.case.expected_sources]
+        labeled_abstention = [
+            result
+            for result in evaluated
+            if result.metrics is not None and result.metrics.abstention_correct is not None
+        ]
+        return {
+            "retrieval": {
+                "k": self.retrieval_k,
+                "evaluated_cases": len(evaluated),
+                "positive_cases": len(positive),
+                "hit_at_k": _mean(
+                    float(result.metrics.hit_at_k) for result in evaluated
+                ),
+                "recall_at_k": _mean(
+                    result.metrics.recall_at_k for result in positive
+                ),
+                "precision_at_k": _mean(
+                    result.metrics.precision_at_k for result in evaluated
+                ),
+                "mrr": _mean(result.metrics.mrr for result in positive),
+            },
+            "citation": {
+                "accuracy": _mean(
+                    result.metrics.citation_accuracy for result in evaluated
+                ),
+                "coverage": _mean(
+                    result.metrics.citation_coverage for result in positive
+                ),
+            },
+            "abstention": {
+                "rate": _mean(
+                    float(result.metrics.abstained) for result in evaluated
+                ),
+                "accuracy": _mean(
+                    float(result.metrics.abstention_correct)
+                    for result in labeled_abstention
+                ),
+                "labeled_cases": len(labeled_abstention),
+            },
+            "latency": {
+                "average_ms": _mean(
+                    float(result.duration_ms)
+                    for result in self.results
+                    if result.duration_ms is not None
+                )
+            },
+        }
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "generated_at": self.generated_at,
             "dataset": self.dataset,
             "duration_ms": self.duration_ms,
@@ -133,6 +217,7 @@ class EvaluationReport:
                 "passed": self.passed,
                 "failed": self.failed,
                 "pass_rate": self.pass_rate,
+                "metrics": self.metrics,
             },
             "results": [result.to_dict() for result in self.results],
         }
@@ -151,6 +236,24 @@ class EvaluationReport:
             f"Evaluation: {self.passed}/{len(self.results)} passed "
             f"({self.pass_rate:.1%}), {self.duration_ms} ms",
         ]
+        retrieval = self.metrics["retrieval"]
+        lines.append(
+            f"Retrieval@{retrieval['k']}: "
+            f"Hit={retrieval['hit_at_k']:.1%} "
+            f"Recall={retrieval['recall_at_k']:.1%} "
+            f"Precision={retrieval['precision_at_k']:.1%} "
+            f"MRR={retrieval['mrr']:.3f}"
+        )
+        citation = self.metrics["citation"]
+        abstention = self.metrics["abstention"]
+        latency = self.metrics["latency"]
+        lines.append(
+            f"Citation: accuracy={citation['accuracy']:.1%} "
+            f"coverage={citation['coverage']:.1%}; "
+            f"abstention_rate={abstention['rate']:.1%} "
+            f"abstention_accuracy={abstention['accuracy']:.1%}; "
+            f"average_latency={latency['average_ms']:.0f} ms"
+        )
         for result in self.results:
             status = "PASS" if result.passed else "FAIL"
             lines.append(
@@ -169,8 +272,11 @@ class EvaluationReport:
 class EvaluationRunner:
     """Runs isolated Agent tasks and evaluates their observable behavior."""
 
-    def __init__(self, agent: AgentRunner):
+    def __init__(self, agent: AgentRunner, retrieval_k: int = 5):
+        if retrieval_k <= 0:
+            raise ValueError("retrieval_k must be greater than zero")
         self.agent = agent
+        self.retrieval_k = retrieval_k
 
     def run(self, cases: list[EvaluationCase], *, dataset: str = "") -> EvaluationReport:
         started_at = time.monotonic()
@@ -179,6 +285,7 @@ class EvaluationRunner:
             dataset=dataset,
             results=results,
             duration_ms=int((time.monotonic() - started_at) * 1000),
+            retrieval_k=self.retrieval_k,
         )
 
     def run_case(self, case: EvaluationCase) -> EvaluationCaseResult:
@@ -204,15 +311,27 @@ class EvaluationRunner:
                 duration_ms=int((time.monotonic() - started_at) * 1000),
                 error=f"{type(exc).__name__}: {exc}",
             )
-        return self._evaluate_result(case, result)
+        return self._evaluate_result(case, result, retrieval_k=self.retrieval_k)
 
     @staticmethod
-    def _evaluate_result(case: EvaluationCase, result: AgentResult) -> EvaluationCaseResult:
+    def _evaluate_result(
+        case: EvaluationCase,
+        result: AgentResult,
+        *,
+        retrieval_k: int = 5,
+    ) -> EvaluationCaseResult:
         trace = result.trace
         answer = result.answer
-        retrieved_sources = sorted({item.chunk.path for item in result.retrieved})
+        retrieved_sources = _unique_source_paths(result.retrieved)
         citation_dicts = [citation.model_dump(mode="json") for citation in answer.citations]
         citation_sources = [citation.path for citation in answer.citations]
+        metrics = _calculate_case_metrics(
+            case=case,
+            retrieved_sources=retrieved_sources,
+            citation_sources=citation_sources,
+            need_more_context=answer.need_more_context,
+            retrieval_k=retrieval_k,
+        )
 
         checks = {
             "answer_present": bool(answer.answer.strip()),
@@ -254,6 +373,7 @@ class EvaluationRunner:
             citations=citation_dicts,
             retrieved_sources=retrieved_sources,
             trace=trace.to_dict(),
+            metrics=metrics,
         )
 
 
@@ -334,3 +454,100 @@ def _sequence_contains(actual: list[str], expected: tuple[str, ...]) -> bool:
             if expected_index == len(expected):
                 return True
     return False
+
+
+def _unique_source_paths(items: list[Any]) -> list[str]:
+    """Keep first-seen source order so ranking metrics remain meaningful."""
+    paths: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        path = item.chunk.path
+        if path not in seen:
+            paths.append(path)
+            seen.add(path)
+    return paths
+
+
+def _calculate_case_metrics(
+    *,
+    case: EvaluationCase,
+    retrieved_sources: list[str],
+    citation_sources: list[str],
+    need_more_context: bool,
+    retrieval_k: int,
+) -> EvaluationCaseMetrics:
+    top_sources = retrieved_sources[:retrieval_k]
+    expected_sources = case.expected_sources
+
+    if expected_sources:
+        matched_retrieved = _count_matching_expected(expected_sources, top_sources)
+        hit_at_k = matched_retrieved > 0
+        recall_at_k = matched_retrieved / len(expected_sources)
+        precision_at_k = (
+            matched_retrieved / len(top_sources) if top_sources else 0.0
+        )
+        first_match = next(
+            (
+                index + 1
+                for index, source in enumerate(top_sources)
+                if _matches_any_expected(source, expected_sources)
+            ),
+            None,
+        )
+        mrr = 1.0 / first_match if first_match is not None else 0.0
+        citation_accuracy = _citation_accuracy(citation_sources, expected_sources)
+        citation_coverage = _coverage(citation_sources, expected_sources)
+    else:
+        no_retrieval = not top_sources
+        hit_at_k = no_retrieval
+        recall_at_k = 1.0 if no_retrieval else 0.0
+        precision_at_k = 1.0 if no_retrieval else 0.0
+        mrr = 0.0
+        citation_accuracy = 1.0 if not citation_sources else 0.0
+        citation_coverage = 1.0 if not citation_sources else 0.0
+
+    abstention_correct = (
+        None
+        if case.should_abstain is None
+        else need_more_context == case.should_abstain
+    )
+    return EvaluationCaseMetrics(
+        retrieval_k=retrieval_k,
+        hit_at_k=hit_at_k,
+        recall_at_k=recall_at_k,
+        precision_at_k=precision_at_k,
+        mrr=mrr,
+        citation_accuracy=citation_accuracy,
+        citation_coverage=citation_coverage,
+        abstained=need_more_context,
+        abstention_correct=abstention_correct,
+    )
+
+
+def _count_matching_expected(expected: tuple[str, ...], actual: list[str]) -> int:
+    return sum(
+        1 for expected_source in expected if _matches_any_expected(expected_source, actual)
+    )
+
+
+def _matches_any_expected(expected: str, actual: list[str] | tuple[str, ...]) -> bool:
+    return any(_source_matches(expected, candidate) for candidate in actual)
+
+
+def _citation_accuracy(citations: list[str], expected: tuple[str, ...]) -> float:
+    if not citations:
+        return 0.0
+    return sum(
+        1 for citation in citations if _matches_any_expected(citation, expected)
+    ) / len(citations)
+
+
+def _coverage(actual: list[str], expected: tuple[str, ...]) -> float:
+    if not expected:
+        return 1.0 if not actual else 0.0
+    return _count_matching_expected(expected, actual) / len(expected)
+
+
+def _mean(values: Iterable[float]) -> float:
+    collected = list(values)
+    return sum(collected) / len(collected) if collected else 0.0

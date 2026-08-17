@@ -7,6 +7,7 @@ from .citations import validate_citations
 from .input import classify_input, parse_command
 from .llm import LLMRequestError
 from .models import Answer, ChatResponse, SearchResult
+from .search import SearchIndex
 from .trace import AgentTrace, TraceStore
 
 
@@ -14,7 +15,7 @@ class ChatService:
     def __init__(
         self,
         *,
-        search_index,
+        search_index: SearchIndex,
         llm,
         agent: AgentRunner | None = None,
         top_k: int = 5,
