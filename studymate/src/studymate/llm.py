@@ -422,12 +422,19 @@ class OpenAIAnswerer:
             or ("none" if self.provider.lower() == "newapi" else "json_object")
         ).lower()
         raw_max_tokens = _env_value("STUDYMATE_MAX_TOKENS") or "4096"
+        raw_timeout = _env_value("STUDYMATE_TIMEOUT_SECONDS") or "60"
         try:
             self.max_tokens = int(raw_max_tokens)
         except ValueError as exc:
             raise ValueError("STUDYMATE_MAX_TOKENS 必须是正整数") from exc
         if self.max_tokens <= 0:
             raise ValueError("STUDYMATE_MAX_TOKENS 必须是正整数")
+        try:
+            self.timeout_seconds = float(raw_timeout)
+        except ValueError as exc:
+            raise ValueError("STUDYMATE_TIMEOUT_SECONDS must be positive") from exc
+        if self.timeout_seconds <= 0:
+            raise ValueError("STUDYMATE_TIMEOUT_SECONDS must be positive")
         if self.provider_type.lower() != "openai_compatible":
             raise ValueError(
                 "当前只支持 STUDYMATE_TYPE=openai_compatible 的模型服务"
@@ -483,9 +490,11 @@ class OpenAIAnswerer:
             f"evidence_count={len(evidence)} history_count={len(history)} "
             f"response_format={self.response_format} stream={self.stream} "
             f"user_agent={self.user_agent or '(none)'} "
+            f"timeout={self.timeout_seconds:g}s "
             f"extra_headers={','.join(sorted(request_headers)) or '(none)'}"
         )
         try:
+            client_kwargs["timeout"] = self.timeout_seconds
             client = OpenAI(**client_kwargs)
             request_kwargs: dict[str, Any] = {
                 "model": self.model,
@@ -565,9 +574,11 @@ class OpenAIAnswerer:
         self._debug(
             f"agent_request={endpoint} provider={self.provider} model={self.model} "
             f"message_count={len(messages)} tool_count={len(tools)} "
-            f"stream={str(self.stream).lower()} max_tokens={self.max_tokens}"
+            f"stream={str(self.stream).lower()} max_tokens={self.max_tokens} "
+            f"timeout={self.timeout_seconds:g}s"
         )
         try:
+            client_kwargs["timeout"] = self.timeout_seconds
             client = OpenAI(**client_kwargs)
             request_kwargs: dict[str, Any] = {
                 "model": self.model,

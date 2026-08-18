@@ -63,6 +63,7 @@ studymate/
       tool-calling.md
       evaluation.md
   traces/                 # 自动生成的问答与 Agent Trace，默认不提交 Git
+  outputs/                # /output 导出的单轮问答、排名和 Trace，默认不提交 Git
 ~~~
 
 支持的文件扩展名：
@@ -140,7 +141,21 @@ py -m studymate chat --knowledge .\knowledge
 py -m studymate chat --trace-dir .\my-traces
 ~~~
 
-对话中输入 `/trace` 可查看上一轮的工具调用、工具结果摘要、停止原因和耗时。Trace 不会作为上下文再次发送给模型。
+对话中输入 `/trace` 可查看上一轮的工具调用、工具结果摘要、停止原因、耗时以及 `search_knowledge` 的 Top-K 排名、分数、路径、行号和命中词。Trace 不会作为上下文再次发送给模型。
+
+在 CMD 交互中，可以使用以下命令保存上一轮问答：
+
+```text
+/output
+```
+
+默认保存到 `outputs/latest.json`。也可以指定文件路径：
+
+```text
+/output .\outputs\mcp-question.json
+```
+
+输出文件包含问题、结构化回答、引用、检索排名和 Trace，但不包含 API Key 或知识库正文。启动时可以使用 `--output-dir` 修改无路径参数时的默认目录。
 
 ### 3.1 运行 Agent Evaluation
 
@@ -159,6 +174,33 @@ py -m studymate eval --knowledge .\\knowledge `
 ~~~powershell
 py -m studymate eval --retrieval-k 5
 ~~~
+
+### 3.2 低频评测与用例筛选
+
+完整评测集适合在模型网关稳定、请求额度充足时运行。日常开发建议先选择高价值用例，并在用例之间留出间隔：
+
+~~~powershell
+py -m studymate eval `
+  --knowledge .\knowledge `
+  --dataset .\tests\eval\questions.jsonl `
+  --case-id q001 `
+  --case-id q019 `
+  --case-id q020 `
+  --delay-seconds 3 `
+  --retries 1 `
+  --retry-delay-seconds 5 `
+  --search-backend sqlite `
+  --search-db .\data\studymate-search.sqlite3 `
+  --output .\evals\sqlite-high-value.json
+~~~
+
+- `--case-id` 可以重复，用于只运行指定用例；`--limit` 可以限制筛选后的数量。
+- `--delay-seconds` 只作用于相邻用例之间，不会在第一条之前等待。
+- `--retries` 只重试连接错误、超时、HTTP 429 和 HTTP 500/502/503/504；401、403、402、参数错误和答案解析错误不会重试。
+- 每条结果的 `attempts` 字段记录实际请求次数，便于区分评测失败和网关瞬时故障。
+- `STUDYMATE_TIMEOUT_SECONDS` 控制单次模型请求超时，默认 60 秒。网关不稳定时可以临时设置为 20 秒，避免单个请求长时间阻塞。
+
+本轮推荐的高价值用例是：`q001` 验证正常检索、引用和多工具流程；`q019` 验证模型是否按要求完成 `search_knowledge -> open_document`；`q020` 验证知识库无答案时的 `empty_search` 和拒答行为。评测失败后应先查看报告中的 `checks`、`trace` 和 `attempts`，再判断是模型行为、评测预期、检索质量还是网关问题。
 
 评测数据支持以下字段：
 
@@ -245,6 +287,7 @@ STUDYMATE_MODEL=claude-sonnet-4-5-20250929
 - `STUDYMATE_BASE_URL` 是 OpenAI 兼容接口根地址。
 - `STUDYMATE_MODEL` 是供应商支持的模型名称。
 - `STUDYMATE_MAX_TOKENS` 是单次 Agent 模型请求允许生成的最大 Token 数，默认 `4096`。
+- `STUDYMATE_TIMEOUT_SECONDS` 是单次模型请求的网络超时时间，默认 `60` 秒；评测排查网关阻塞时可临时调小。
 - 对 `provider=newapi`，如果 Base URL 没有路径，程序会自动补充 `/v1`。
 - `STUDYMATE_DEBUG=true` 会输出脱敏的请求诊断信息，排查完成后建议改为 `false`。
 - `STUDYMATE_RESPONSE_FORMAT` 可设为 `json_object` 或 `none`。NewAPI/Claude 兼容接口默认建议使用 `none`，避免上游拦截该参数；程序仍会通过 Prompt 要求模型返回 JSON。
@@ -289,13 +332,14 @@ STUDYMATE_API_KEY=填写你的 DeepSeek API Key
 - CLI 对话服务。
 - 问题、学习目标、关键词输入分类。
 - 回答来源校验。
-- /help、/sources、/trace、/reset、/quit 命令。
+- /help、/sources、/trace、/output、/reset、/quit 命令。
 - OpenAI 兼容模型调用适配。
 - 自动更新 Claude Code、OpenCode、Codex 官方 Markdown 文档。
 - 第一阶段最小 Agent Runtime。
 - 原生 Tool Calling 和工具结果回传。
 - `search_knowledge`、`open_document` 两个只读工具。
 - Agent Trace、`/trace` 和按会话 JSONL 问答记录。
+- `/trace` 检索排名展示和 `/output` 单轮问答 JSON 导出。
 - Agent Evaluation、JSONL 评测数据和 JSON 汇总报告。
 
 当前默认搜索基线是 `InMemorySearchIndex`，通过 `SearchIndex` 接口向 Agent 工具提供检索能力。它使用无额外依赖的 BM25 风格评分，并加入中英文领域词扩展、`agentloop`/CamelCase/连字符归一化、查询停用词过滤、短语匹配以及标题/路径加权。
@@ -442,6 +486,8 @@ Agent 不再由 `ChatService` 固定执行检索，而是把 `search_knowledge` 
 | 2026-08-17 | 检索质量指标 | `src/studymate/evaluation.py`、`src/studymate/cli.py`、`docs/06-evaluation.md` | 增加 `Hit@K`、`Recall@K`、`Precision@K`、`MRR`、Citation Accuracy/Coverage、Abstention Rate/Accuracy 和平均延迟；报告 schema 升级为 2，支持 `--retrieval-k`。 |
 | 2026-08-17 | SQLite FTS5 / BM25 后端 | `src/studymate/search.py`、`src/studymate/cli.py`、`docs/adr/ADR-001-search-strategy.md` | 增加 `SQLiteFTS5SearchIndex`；按 Chunk 建立 FTS5 索引，使用 SQLite `bm25()` 排序，并通过 `--search-backend` 在内存和 SQLite 后端之间切换。 |
 | 2026-08-18 | 检索范围收敛 | `src/studymate/cli.py`、`src/studymate/comparison.py`、`.env.example` | 主流程关闭 Embedding 和 LLM Reranker，只保留内存 BM25 风格检索与 SQLite FTS5/BM25；相关源码保留为学习实验，避免意外 API 成本。 |
+| 2026-08-18 | Trace 检索排名与问答导出 | `src/studymate/agent.py`、`src/studymate/trace.py`、`src/studymate/chat.py`、`src/studymate/cli.py` | `/trace` 显示 `search_knowledge` 的 Top-K 排名；`/output` 保存问题、回答、引用、检索排名和 Trace 到 JSON；不调用 Embedding。测试结果为 `72 passed`。 |
+| 2026-08-19 | 低频 Agent Evaluation | `src/studymate/evaluation.py`、`src/studymate/cli.py`、`src/studymate/llm.py`、`.env.example`、`tests/eval/test_evaluation.py` | 增加 `--case-id`、`--limit`、用例间隔、瞬时错误重试和单次请求超时；报告记录 `attempts`。完整 pytest 为 `76 passed`。真实 SQLite 评测中 `q001`、`q020` 通过；`q019` 因模型重复调用已耗尽预算的 `search_knowledge` 而失败，定位为 Agent 行为/评测预期问题，不是连接失败。 |
 
 当前待办方向：使用 `compare-search` 和评测集验证内存 BM25 与 SQLite FTS5/BM25 的实际排名；之后再学习 Chunk 参数、混合检索、跨进程记忆和 MCP。
 

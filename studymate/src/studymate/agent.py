@@ -157,14 +157,17 @@ class AgentRunner:
                 else:
                     tool_call_counts[call.name] = tool_call_counts.get(call.name, 0) + 1
                     execution = self.tool_registry.execute(call.name, call.arguments)
-                trace_step.executions.append(
-                    {
-                        "name": execution.name,
-                        "status": "error" if execution.is_error else "ok",
-                        "evidence_count": len(execution.evidence),
-                        "error": _execution_error(execution),
-                    }
-                )
+                execution_record = {
+                    "name": execution.name,
+                    "status": "error" if execution.is_error else "ok",
+                    "evidence_count": len(execution.evidence),
+                    "error": _execution_error(execution),
+                }
+                if call.name == "search_knowledge" and not execution.is_error:
+                    execution_record["ranking"] = _serialize_search_results(
+                        execution.evidence
+                    )
+                trace_step.executions.append(execution_record)
                 self._merge_evidence(retrieved, execution)
                 messages.append(self._tool_message(call, execution))
                 if (
@@ -367,3 +370,19 @@ def _execution_error(execution: ToolExecution) -> str | None:
         return None
     error = execution.payload.get("error")
     return error if isinstance(error, str) else None
+
+
+def _serialize_search_results(results: list[SearchResult]) -> list[dict[str, Any]]:
+    return [
+        {
+            "rank": rank,
+            "chunk_id": result.chunk.id,
+            "path": result.chunk.path,
+            "title": result.chunk.title,
+            "start_line": result.chunk.start_line,
+            "end_line": result.chunk.end_line,
+            "score": result.score,
+            "matched_terms": result.matched_terms,
+        }
+        for rank, result in enumerate(results, start=1)
+    ]

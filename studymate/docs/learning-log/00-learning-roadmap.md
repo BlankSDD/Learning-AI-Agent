@@ -14,7 +14,8 @@
 - 中英文领域词查询扩展、停用词过滤、查询归一化、短语匹配以及标题/路径加权的 BM25 风格检索。
 - `SearchIndex` 可替换检索接口，已实现 `InMemorySearchIndex` 和 `SQLiteFTS5SearchIndex` 两个词法检索后端。
 - `compare-search` 检索对比日志，用于比较内存 BM25 风格检索与 SQLite FTS5/BM25。
-- 完整 pytest 已通过：`71 passed`；当前测试和主流程不调用 Embedding API。
+- `/trace` 可显示 Agent 检索排名，`/output` 可导出单轮问答、引用、排名和 Trace。
+- 完整 pytest 已通过：`72 passed`；当前测试和主流程不调用 Embedding API。
 
 尚未完成的能力不应写进简历：Embedding/向量检索、Reranker、混合检索、跨进程会话恢复、MCP Server 和 AI Coding Agent。
 

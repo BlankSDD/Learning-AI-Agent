@@ -49,6 +49,27 @@ def test_agent_turn_is_persisted_and_trace_command_shows_last_run(tmp_path):
     assert "停止原因：final_answer" in trace_response.answer.answer
 
 
+def test_output_command_saves_last_answer_and_trace(tmp_path):
+    trace = AgentTrace()
+    trace.finish("final_answer")
+    service = ChatService(
+        search_index=FakeSearchIndex(),
+        llm=FakeLLM(),
+        agent=FakeAgent(trace),
+        output_dir=tmp_path / "outputs",
+    )
+
+    service.handle("什么是 RAG？")
+    response = service.handle("/output")
+
+    output_path = tmp_path / "outputs" / "latest.json"
+    record = json.loads(output_path.read_text(encoding="utf-8"))
+    assert "问答输出已保存" in response.answer.answer
+    assert record["user_input"] == "什么是 RAG？"
+    assert record["answer"]["answer"] == "RAG retrieves evidence."
+    assert record["trace"]["stop_reason"] == "final_answer"
+
+
 class FakeSearchIndex:
     def search(self, query: str, top_k: int = 5):
         return []

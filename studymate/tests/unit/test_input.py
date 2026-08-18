@@ -23,6 +23,7 @@ def test_classify_keyword():
 def test_parse_supported_command():
     assert parse_command("/sources").name == "sources"
     assert parse_command("/trace").name == "trace"
+    assert parse_command("/output latest.json").args == ["latest.json"]
     assert parse_command("/reset").name == "reset"
     assert parse_command("/update claude-code").args == ["claude-code"]
     assert parse_command("/quit").name == "quit"

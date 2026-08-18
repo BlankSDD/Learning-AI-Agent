@@ -71,6 +71,10 @@ def test_agent_calls_search_then_returns_grounded_answer(tmp_path):
     assert result.trace.stop_reason == "final_answer"
     assert result.trace.steps[0].requested_tools[0]["name"] == "search_knowledge"
     assert result.trace.steps[0].executions[0]["evidence_count"] == 1
+    ranking = result.trace.steps[0].executions[0]["ranking"]
+    assert ranking[0]["rank"] == 1
+    assert ranking[0]["path"] == "rag.md"
+    assert ranking[0]["score"] == result.retrieved[0].score
     assert model.calls[1]["messages"][-1]["role"] == "tool"
     assert {tool["function"]["name"] for tool in model.calls[0]["tools"]} == {
         "search_knowledge",

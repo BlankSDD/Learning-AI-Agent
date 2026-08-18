@@ -7,7 +7,12 @@ from .agent import AgentRunner
 from .chat import ChatService
 from .comparison import run_search_comparison
 from .docs_updater import DocsUpdateError, update_sources
-from .evaluation import EvaluationDatasetError, EvaluationRunner, load_evaluation_dataset
+from .evaluation import (
+    EvaluationDatasetError,
+    EvaluationRunner,
+    load_evaluation_dataset,
+    select_evaluation_cases,
+)
 from .ingest import chunk_document, load_documents
 from .llm import OpenAIAnswerer
 from .search import build_search_index
@@ -48,6 +53,35 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=5,
         help="K used for retrieval quality metrics",
+    )
+    evaluation.add_argument(
+        "--case-id",
+        action="append",
+        dest="case_ids",
+        help="run only this evaluation case; repeat for multiple ids",
+    )
+    evaluation.add_argument(
+        "--limit",
+        type=int,
+        help="run at most this many cases after --case-id filtering",
+    )
+    evaluation.add_argument(
+        "--delay-seconds",
+        type=float,
+        default=0.0,
+        help="seconds to wait between evaluation cases",
+    )
+    evaluation.add_argument(
+        "--retries",
+        type=int,
+        default=0,
+        help="retries for connection, throttling, and temporary server errors",
+    )
+    evaluation.add_argument(
+        "--retry-delay-seconds",
+        type=float,
+        default=3.0,
+        help="seconds to wait before retrying a transient error",
     )
     _add_search_options(evaluation)
 
@@ -125,6 +159,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("traces"),
         help="directory receiving per-session question/answer/trace JSONL files",
     )
+    chat.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("outputs"),
+        help="directory used by /output when no file path is supplied",
+    )
     _add_search_options(chat)
     return parser
 
@@ -161,11 +201,21 @@ def run_eval(
     retrieval_k: int = 5,
     search_backend: str = "memory",
     search_db: Path | None = None,
+    case_ids: list[str] | None = None,
+    limit: int | None = None,
+    delay_seconds: float = 0.0,
+    retries: int = 0,
+    retry_delay_seconds: float = 3.0,
 ) -> int:
     try:
         cases = load_evaluation_dataset(dataset_path)
     except EvaluationDatasetError as exc:
         print(f"Evaluation dataset error: {exc}")
+        return 1
+    try:
+        cases = select_evaluation_cases(cases, case_ids=case_ids, limit=limit)
+    except ValueError as exc:
+        print(f"Evaluation selection error: {exc}")
         return 1
     if not cases:
         print("Evaluation dataset is empty.")
@@ -187,9 +237,18 @@ def run_eval(
         llm=OpenAIAnswerer(),
         tool_registry=build_knowledge_tool_registry(knowledge_tools),
     )
-    report = EvaluationRunner(agent, retrieval_k=retrieval_k).run(
-        cases, dataset=str(dataset_path)
-    )
+    try:
+        runner = EvaluationRunner(
+            agent,
+            retrieval_k=retrieval_k,
+            case_delay_seconds=delay_seconds,
+            retries=retries,
+            retry_delay_seconds=retry_delay_seconds,
+        )
+    except ValueError as exc:
+        print(f"Evaluation options error: {exc}")
+        return 1
+    report = runner.run(cases, dataset=str(dataset_path))
     try:
         report_path = report.write_json(output_path)
     except OSError as exc:
@@ -275,6 +334,7 @@ def run_chat(
     docs_config: Path,
     proxy: str | None,
     trace_dir: Path,
+    output_dir: Path,
     search_backend: str = "memory",
     search_db: Path | None = None,
 ) -> int:
@@ -331,6 +391,7 @@ def run_chat(
         top_k=top_k,
         update_handler=update_handler,
         trace_store=TraceStore(trace_dir),
+        output_dir=output_dir,
     )
     print(
         f"StudyMate loaded {len(documents)} documents. "
@@ -338,6 +399,7 @@ def run_chat(
         "Type /help for commands."
     )
     print(f"Trace records: {service.trace_store.path}")
+    print(f"Output directory: {output_dir}")
     while True:
         try:
             text = input("You> ").strip()
@@ -373,6 +435,11 @@ def main() -> int:
             retrieval_k=args.retrieval_k,
             search_backend=args.search_backend,
             search_db=args.search_db,
+            case_ids=args.case_ids,
+            limit=args.limit,
+            delay_seconds=args.delay_seconds,
+            retries=args.retries,
+            retry_delay_seconds=args.retry_delay_seconds,
         )
     if args.command == "compare-search":
         return run_compare_search(
@@ -398,6 +465,7 @@ def main() -> int:
             args.docs_config,
             args.proxy,
             args.trace_dir,
+            args.output_dir,
             args.search_backend,
             args.search_db,
         )

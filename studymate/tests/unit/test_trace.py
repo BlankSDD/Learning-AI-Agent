@@ -49,6 +49,16 @@ def test_agent_trace_formats_a_readable_last_run_summary():
                     "name": "search_knowledge",
                     "status": "ok",
                     "evidence_count": 1,
+                    "ranking": [
+                        {
+                            "rank": 1,
+                            "path": "rag.md",
+                            "start_line": 1,
+                            "end_line": 3,
+                            "score": 2.5,
+                            "matched_terms": ["rag"],
+                        }
+                    ],
                 }
             ],
         )
@@ -60,3 +70,5 @@ def test_agent_trace_formats_a_readable_last_run_summary():
     assert "停止原因：final_answer" in summary
     assert "search_knowledge" in summary
     assert "证据片段：1" in summary
+    assert "检索排名" in summary
+    assert "1. rag.md:1-3 score=2.500000 terms=rag" in summary

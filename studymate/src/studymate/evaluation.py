@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -81,6 +82,7 @@ class EvaluationCaseResult:
     retrieved_sources: list[str] = field(default_factory=list)
     trace: dict[str, Any] | None = None
     error: str | None = None
+    attempts: int = 1
     metrics: "EvaluationCaseMetrics | None" = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -98,6 +100,7 @@ class EvaluationCaseResult:
             "retrieved_sources": self.retrieved_sources,
             "trace": self.trace,
             "error": self.error,
+            "attempts": self.attempts,
             "metrics": self.metrics.to_dict() if self.metrics is not None else None,
         }
 
@@ -259,6 +262,7 @@ class EvaluationReport:
             lines.append(
                 f"- {result.case.id}: {status} "
                 f"stop={result.stop_reason or 'error'} "
+                f"attempts={result.attempts} "
                 f"steps={result.steps} tools={len(result.tool_calls)}"
             )
             if result.error:
@@ -272,15 +276,38 @@ class EvaluationReport:
 class EvaluationRunner:
     """Runs isolated Agent tasks and evaluates their observable behavior."""
 
-    def __init__(self, agent: AgentRunner, retrieval_k: int = 5):
+    def __init__(
+        self,
+        agent: AgentRunner,
+        retrieval_k: int = 5,
+        *,
+        case_delay_seconds: float = 0.0,
+        retries: int = 0,
+        retry_delay_seconds: float = 3.0,
+        sleep_fn: Any = time.sleep,
+    ):
         if retrieval_k <= 0:
             raise ValueError("retrieval_k must be greater than zero")
+        if case_delay_seconds < 0:
+            raise ValueError("case_delay_seconds must not be negative")
+        if retries < 0:
+            raise ValueError("retries must not be negative")
+        if retry_delay_seconds < 0:
+            raise ValueError("retry_delay_seconds must not be negative")
         self.agent = agent
         self.retrieval_k = retrieval_k
+        self.case_delay_seconds = case_delay_seconds
+        self.retries = retries
+        self.retry_delay_seconds = retry_delay_seconds
+        self.sleep_fn = sleep_fn
 
     def run(self, cases: list[EvaluationCase], *, dataset: str = "") -> EvaluationReport:
         started_at = time.monotonic()
-        results = [self.run_case(case) for case in cases]
+        results: list[EvaluationCaseResult] = []
+        for index, case in enumerate(cases):
+            if index and self.case_delay_seconds:
+                self.sleep_fn(self.case_delay_seconds)
+            results.append(self.run_case(case))
         return EvaluationReport(
             dataset=dataset,
             results=results,
@@ -291,27 +318,38 @@ class EvaluationRunner:
     def run_case(self, case: EvaluationCase) -> EvaluationCaseResult:
         prompt = f"[{case.intent}] {case.input}" if case.intent else case.input
         started_at = time.monotonic()
-        try:
-            result = self.agent.run(user_input=prompt, history=[])
-        except Exception as exc:
-            return EvaluationCaseResult(
-                case=case,
-                passed=False,
-                checks={
-                    "answer_present": False,
-                    "loop_completed": False,
-                    "stop_reason_matches": False,
-                    "tool_success": False,
-                    "tool_calls_match": False,
-                    "retrieval_matches": False,
-                    "citations_match": False,
-                    "required_terms": False,
-                    "abstention_matches": False,
-                },
-                duration_ms=int((time.monotonic() - started_at) * 1000),
-                error=f"{type(exc).__name__}: {exc}",
-            )
-        return self._evaluate_result(case, result, retrieval_k=self.retrieval_k)
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                result = self.agent.run(user_input=prompt, history=[])
+            except Exception as exc:
+                should_retry = _is_retryable_exception(exc) and attempts <= self.retries
+                if should_retry:
+                    if self.retry_delay_seconds:
+                        self.sleep_fn(self.retry_delay_seconds)
+                    continue
+                return EvaluationCaseResult(
+                    case=case,
+                    passed=False,
+                    checks={
+                        "answer_present": False,
+                        "loop_completed": False,
+                        "stop_reason_matches": False,
+                        "tool_success": False,
+                        "tool_calls_match": False,
+                        "retrieval_matches": False,
+                        "citations_match": False,
+                        "required_terms": False,
+                        "abstention_matches": False,
+                    },
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                    error=f"{type(exc).__name__}: {exc}",
+                    attempts=attempts,
+                )
+            evaluated = self._evaluate_result(case, result, retrieval_k=self.retrieval_k)
+            evaluated.attempts = attempts
+            return evaluated
 
     @staticmethod
     def _evaluate_result(
@@ -403,6 +441,30 @@ def load_evaluation_dataset(path: Path) -> list[EvaluationCase]:
         seen_ids.add(case.id)
         cases.append(case)
     return cases
+
+
+def select_evaluation_cases(
+    cases: list[EvaluationCase],
+    *,
+    case_ids: list[str] | None = None,
+    limit: int | None = None,
+) -> list[EvaluationCase]:
+    """Select a stable subset while preserving dataset order."""
+    if limit is not None and limit <= 0:
+        raise ValueError("limit must be greater than zero")
+
+    selected = cases
+    if case_ids:
+        requested = {case_id.strip() for case_id in case_ids if case_id.strip()}
+        known = {case.id for case in cases}
+        missing = sorted(requested - known)
+        if missing:
+            raise ValueError(f"evaluation case id not found: {', '.join(missing)}")
+        selected = [case for case in cases if case.id in requested]
+
+    if limit is not None:
+        selected = selected[:limit]
+    return selected
 
 
 def _string_tuple(value: Any, field_name: str, line_number: int) -> tuple[str, ...]:
@@ -551,3 +613,67 @@ def _coverage(actual: list[str], expected: tuple[str, ...]) -> float:
 def _mean(values: Iterable[float]) -> float:
     collected = list(values)
     return sum(collected) / len(collected) if collected else 0.0
+
+
+def _is_retryable_exception(exc: Exception) -> bool:
+    """Retry transient transport, throttling, and temporary server failures only."""
+    status = _exception_status_code(exc)
+    if status is None:
+        status = _status_code_from_text(exc)
+    if status is not None:
+        return status == 429 or 500 <= status <= 504
+
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, (TimeoutError, ConnectionError)):
+            return True
+        text = str(current).casefold()
+        if any(
+            marker in text
+            for marker in (
+                "connection error",
+                "connection reset",
+                "remote disconnected",
+                "server disconnected",
+                "timed out",
+                "timeout",
+                "temporarily unavailable",
+                "too many requests",
+                "rate limit",
+            )
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _exception_status_code(exc: BaseException) -> int | None:
+    for current in _exception_chain(exc):
+        for attribute in ("status_code", "status"):
+            value = getattr(current, attribute, None)
+            if isinstance(value, int):
+                return value
+    return None
+
+
+def _status_code_from_text(exc: BaseException) -> int | None:
+    for current in _exception_chain(exc):
+        match = re.search(
+            r"\bHTTP\s*(\d{3})\b|\bstatus(?:_code)?[=: ]+(\d{3})\b",
+            str(current),
+            re.IGNORECASE,
+        )
+        if match:
+            return int(match.group(1) or match.group(2))
+    return None
+
+
+def _exception_chain(exc: BaseException) -> Iterable[BaseException]:
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__

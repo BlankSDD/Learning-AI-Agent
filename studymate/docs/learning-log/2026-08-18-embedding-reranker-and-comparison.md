@@ -138,3 +138,71 @@ STUDYMATE_RERANK_BASE_URL=
 6. **AI Coding Agent 入门**：在隔离工作区实现文件扫描、搜索、受控修改、运行测试和 Git Diff 审查。
 
 Embedding、向量数据库、混合检索和 Reranker 放在后续实验阶段。只有当本地词法检索评测明确暴露出同义表达召回不足时，再单独评估本地模型、在线 API 的成本和收益。
+
+## 九、今日新增工程能力：Trace 排名与问答导出
+
+为了在 CMD 交互中直接观察 Agent 的检索行为，本次新增了两项能力：
+
+- `/trace`：在工具执行摘要下显示 `search_knowledge` 的 Top-K 排名、分数、路径、行号和命中词。它只展示调试信息，不会把排名重新发送给模型。
+- `/output`：将上一轮问题、结构化回答、引用、检索排名和 Trace 保存到 `outputs/latest.json`。
+- `/output .\outputs\mcp-question.json`：也可以指定一个保存路径。
+
+这两个命令解决了“模型回答”和“检索是否命中”难以同时观察的问题：先正常提问，再输入 `/trace` 查看过程，最后输入 `/output` 保存本轮结果。输出只保存元数据和 Trace，不保存 API Key 或完整知识库正文。
+
+本次测试结果：`72 passed`，没有调用 Embedding API。
+
+## 十、评测集扩充与 `compare-search`
+
+本次将 `tests/eval/questions.jsonl` 从 15 条扩充到 20 条，新增 `q016` 到 `q020`：
+
+| 用例 | 覆盖方向 |
+| --- | --- |
+| `q016` | `agentloop` 与 `agent loop` 的查询变体 |
+| `q017` | 英文 MCP 概念问题 |
+| `q018` | 明确要求文档引用的问题 |
+| `q019` | 明确要求 `search_knowledge -> open_document` 的多工具问题 |
+| `q020` | 英文无答案/拒答问题 |
+
+`compare-search` 是一个本地检索对比命令，不是 Agent，也不是最终评测：
+
+```text
+同一个 query
+    -> InMemorySearchIndex（BM25 风格）
+    -> SQLiteFTS5SearchIndex（FTS5 + BM25）
+    -> 分别输出 Top-K、score、路径、行号和命中词
+```
+
+它的作用是观察两个检索后端对同一查询的召回和排序差异，并将结果保存为 JSONL。它不调用聊天模型，不执行 Tool Calling，也不使用 Embedding，因此适合在运行 Agent Eval 之前先检查 `expected_sources` 是否合理。
+
+需要注意：`compare-search` 比较的是传入的原始 query；Agent 可能会先把用户问题改写成 `MCP` 或 `Agent Loop` 再调用 `search_knowledge`。所以它是检索基线观察工具，不能完全代替真实 Agent Eval。
+
+## 十一、SQLite 检索对比与 Agent Eval 结果
+
+本次使用 20 条评测问题运行了完整的 `compare-search`，结果写入被 Git 忽略的本地文件：
+
+```text
+logs/sqlite-eval-20-comparison.jsonl
+```
+
+观察结果：
+
+- `MCP 是什么？`：SQLite 的第 1 名是 `claude-code/04-agent-development/mcp-quickstart.md`。
+- `Agent Loop 是什么？`：SQLite 的第 1 名是 `claude-code/07-agent-sdk/agent-loop.md`。
+- 自定义工具问题：目标 `custom-tools.md` 进入 Top-5，但 SQLite 将 OpenCode 的同名文档排在第 1 名，说明同名主题会产生跨项目竞争。
+- `Connect to MCP servers...`：SQLite 将 MCP Quickstart 排在第 1 名，而内存后端更容易召回 OpenCode MCP 文档。
+- 英文未知问题：两个后端都返回空结果，拒答基线正常。
+- `q019` 的完整自然语言指令没有直接召回 Agent Loop 文档，说明 `compare-search` 的原始 query 与 Agent 可能改写后的工具 query 不完全相同；该用例需要通过真实 Agent Eval 判断。
+
+随后运行 SQLite Agent Eval 时，结果为 `0/20`，但 20 条全部在首次 Chat Completions 请求阶段报 `Connection error`，没有进入工具调用和检索步骤。之后单独运行一条 SQLite Agent 问答成功，并完成了 `search_knowledge -> open_document -> finalization`；但紧接着再次批量运行 20 条 Eval 仍全部连接失败。这说明网关的单次交互可以成功，连续批量请求可能触发连接或限流层问题。因此这不是 SQLite 检索质量结论，也不能据此修改检索实现。需要先处理批量请求稳定性，再重新运行：
+
+```powershell
+.venv\Scripts\python.exe -m studymate eval `
+  --knowledge .\knowledge `
+  --dataset .\tests\eval\questions.jsonl `
+  --search-backend sqlite `
+  --search-db .\data\studymate-search.sqlite3 `
+  --retrieval-k 5 `
+  --output .\evals\sqlite-20.json
+```
+
+本次没有调用 Embedding。当前正确顺序是：先恢复模型调用，再比较 memory/SQLite 的 Agent Eval；在此之前不根据 `0/20` 修改 Chunk 或 BM25 参数。

@@ -84,7 +84,43 @@ class AgentTrace:
                 lines.append(
                     f"  执行工具：{execution.get('name', 'unknown')}（{'，'.join(details)}）"
                 )
+                ranking = execution.get("ranking")
+                if ranking:
+                    lines.append("    检索排名：")
+                    for result in ranking:
+                        score = result.get("score", "?")
+                        if isinstance(score, (int, float)):
+                            score = f"{score:.6f}"
+                        terms = ",".join(result.get("matched_terms", [])) or "-"
+                        lines.append(
+                            f"      {result.get('rank', '?')}. "
+                            f"{result.get('path', 'unknown')}:"
+                            f"{result.get('start_line', '?')}-"
+                            f"{result.get('end_line', '?')} "
+                            f"score={score} terms={terms}"
+                        )
         return "\n".join(lines)
+
+
+def extract_retrieval_rankings(trace: AgentTrace | None) -> list[dict[str, Any]]:
+    """Return search rankings in a compact format for exported turn output."""
+    if trace is None:
+        return []
+
+    rankings: list[dict[str, Any]] = []
+    for step in trace.steps:
+        for execution in step.executions:
+            ranking = execution.get("ranking")
+            if not ranking:
+                continue
+            rankings.append(
+                {
+                    "step": step.step,
+                    "tool": execution.get("name", "search_knowledge"),
+                    "results": ranking,
+                }
+            )
+    return rankings
 
 
 class TraceStore:

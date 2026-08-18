@@ -20,3 +20,4 @@
 4. [2026-08-16 第一阶段复盘与第二阶段计划](2026-08-16-phase-one-review-and-phase-two-plan.md)
 5. [2026-08-17 检索接口与 BM25 风格基线](2026-08-17-retrieval-interface-and-bm25-baseline.md)
 6. [2026-08-18 Embedding、Reranker 与检索结果对比](2026-08-18-embedding-reranker-and-comparison.md)
+7. [2026-08-19 Evaluation 低频执行、用例筛选与重试](2026-08-19-evaluation-pacing-and-retry.md)

@@ -5,6 +5,7 @@ from studymate.evaluation import (
     EvaluationCase,
     EvaluationRunner,
     load_evaluation_dataset,
+    select_evaluation_cases,
 )
 from studymate.models import Answer, Citation, Chunk, SearchResult
 from studymate.trace import AgentTrace, AgentTraceStep
@@ -18,6 +19,25 @@ class StubAgent:
     def run(self, *, user_input, history):
         self.inputs.append((user_input, history))
         return self.result
+
+
+class SequenceAgent:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.inputs = []
+
+    def run(self, *, user_input, history):
+        self.inputs.append((user_input, history))
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+
+class StatusError(Exception):
+    def __init__(self, status_code):
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
 
 
 def make_result(*, stop_reason="final_answer", need_more_context=False):
@@ -151,3 +171,113 @@ def test_evaluation_reports_the_full_trace():
     assert result.trace is not None
     assert result.trace["stop_reason"] == "final_answer"
     assert result.trace["steps"][0]["executions"][0]["name"] == "search_knowledge"
+
+
+def test_select_evaluation_cases_filters_and_limits_in_dataset_order():
+    cases = [
+        EvaluationCase(
+            id="q001",
+            input="one",
+            expected_sources=("mcp.md",),
+        ),
+        EvaluationCase(
+            id="q002",
+            input="two",
+            expected_sources=("mcp.md",),
+        ),
+        EvaluationCase(id="q003", input="three"),
+    ]
+
+    selected = select_evaluation_cases(
+        cases,
+        case_ids=["q003", "q001"],
+        limit=1,
+    )
+
+    assert [case.id for case in selected] == ["q001"]
+
+
+def test_select_evaluation_cases_rejects_unknown_id():
+    cases = [EvaluationCase(id="q001", input="one")]
+
+    try:
+        select_evaluation_cases(cases, case_ids=["q404"])
+    except ValueError as exc:
+        assert "q404" in str(exc)
+    else:
+        raise AssertionError("unknown case id should fail fast")
+
+
+def test_evaluation_retries_transient_error_and_delays_between_cases():
+    agent = SequenceAgent(
+        [
+            ConnectionError("Connection error."),
+            make_result(),
+            make_result(),
+        ]
+    )
+    sleeps = []
+    runner = EvaluationRunner(
+        agent,
+        retries=1,
+        retry_delay_seconds=5,
+        case_delay_seconds=2,
+        sleep_fn=sleeps.append,
+    )
+    cases = [
+        EvaluationCase(
+            id="q001",
+            input="one",
+            expected_sources=("mcp.md",),
+        ),
+        EvaluationCase(
+            id="q002",
+            input="two",
+            expected_sources=("mcp.md",),
+        ),
+    ]
+
+    report = runner.run(cases)
+
+    assert report.passed == 2
+    assert [result.attempts for result in report.results] == [2, 1]
+    assert sleeps == [5, 2]
+
+
+def test_evaluation_retries_rate_limit_but_not_forbidden_error():
+    retry_agent = SequenceAgent([StatusError(429), make_result()])
+    retry_sleeps = []
+    retry_result = EvaluationRunner(
+        retry_agent,
+        retries=1,
+        retry_delay_seconds=1,
+        sleep_fn=retry_sleeps.append,
+    ).run_case(
+        EvaluationCase(
+            id="rate-limit",
+            input="one",
+            expected_sources=("mcp.md",),
+        )
+    )
+
+    forbidden_agent = SequenceAgent([StatusError(403), make_result()])
+    forbidden_sleeps = []
+    forbidden_result = EvaluationRunner(
+        forbidden_agent,
+        retries=1,
+        retry_delay_seconds=1,
+        sleep_fn=forbidden_sleeps.append,
+    ).run_case(
+        EvaluationCase(
+            id="forbidden",
+            input="two",
+            expected_sources=("mcp.md",),
+        )
+    )
+
+    assert retry_result.passed is True
+    assert retry_result.attempts == 2
+    assert retry_sleeps == [1]
+    assert forbidden_result.passed is False
+    assert forbidden_result.attempts == 1
+    assert forbidden_sleeps == []
