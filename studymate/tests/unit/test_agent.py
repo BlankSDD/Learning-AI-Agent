@@ -75,14 +75,13 @@ def test_agent_calls_search_then_returns_grounded_answer(tmp_path):
     assert ranking[0]["rank"] == 1
     assert ranking[0]["path"] == "rag.md"
     assert ranking[0]["score"] == result.retrieved[0].score
-    assert model.calls[1]["messages"][-1]["role"] == "tool"
+    assert model.calls[1]["messages"][-1]["role"] == "user"
+    assert "Tool observations:" in model.calls[1]["messages"][-1]["content"]
     assert {tool["function"]["name"] for tool in model.calls[0]["tools"]} == {
         "search_knowledge",
         "open_document",
     }
-    assert [tool["function"]["name"] for tool in model.calls[1]["tools"]] == [
-        "open_document"
-    ]
+    assert model.calls[1]["tools"] == []
 
 
 def test_agent_can_call_open_document_after_search(tmp_path):
@@ -116,6 +115,70 @@ def test_agent_can_call_open_document_after_search(tmp_path):
     assert result.tool_calls == ["search_knowledge", "open_document"]
     assert model.calls[2]["tools"] == []
     assert model.calls[2]["messages"][-1]["role"] == "user"
+
+
+def test_agent_blocks_multiple_open_document_calls_in_one_response(tmp_path):
+    search_call = ModelToolResponse(
+        tool_calls=[
+            ToolCallRequest(
+                id="call-search",
+                name="search_knowledge",
+                arguments={"query": "RAG"},
+            )
+        ]
+    )
+    batch_open_call = ModelToolResponse(
+        tool_calls=[
+            ToolCallRequest(
+                id="call-open-1",
+                name="open_document",
+                arguments={"path": "rag.md", "start_line": 1, "end_line": 2},
+            ),
+            ToolCallRequest(
+                id="call-open-2",
+                name="open_document",
+                arguments={"path": "rag.md", "start_line": 1, "end_line": 3},
+            ),
+        ]
+    )
+    runner, model, chunks = build_runner(
+        tmp_path,
+        [search_call, batch_open_call, final_response("")],
+    )
+    model.responses[2] = final_response(chunks[0].id)
+
+    result = runner.run(user_input="Explain RAG from the document")
+
+    assert result.steps == 3
+    assert result.tool_calls == [
+        "search_knowledge",
+        "open_document",
+        "open_document",
+    ]
+    assert result.trace.steps[1].executions[0]["status"] == "ok"
+    assert result.trace.steps[1].executions[1]["status"] == "error"
+    assert "per-run call budget" in result.trace.steps[1].executions[1]["error"]
+
+
+def test_agent_prompt_prefers_search_only_for_simple_definitions(tmp_path):
+    search_call = ModelToolResponse(
+        tool_calls=[
+            ToolCallRequest(
+                id="call-search",
+                name="search_knowledge",
+                arguments={"query": "RAG"},
+            )
+        ]
+    )
+    runner, _, chunks = build_runner(tmp_path, [search_call, final_response("")])
+    runner.llm.responses[1] = final_response(chunks[0].id)
+
+    runner.run(user_input="What is RAG?")
+
+    system_prompt = runner.llm.calls[0]["messages"][0]["content"]
+    assert "For a simple definition question" in system_prompt
+    assert "Call open_document at most once per run" in system_prompt
+    assert runner.llm.calls[1]["tools"] == []
 
 
 def test_agent_finalization_removes_tool_messages(tmp_path):
@@ -194,7 +257,7 @@ def test_agent_stops_after_an_empty_knowledge_search(tmp_path):
     assert len(model.calls) == 1
 
 
-def test_agent_forces_finalization_after_a_repeated_tool_request(tmp_path):
+def test_agent_blocks_repeated_tool_request_but_keeps_other_tools_available(tmp_path):
     search_call = ModelToolResponse(
         tool_calls=[
             ToolCallRequest(
@@ -223,7 +286,60 @@ def test_agent_forces_finalization_after_a_repeated_tool_request(tmp_path):
 
     assert result.answer.answer.startswith("RAG retrieves")
     assert result.steps == 3
-    assert model.calls[2]["tools"] == []
+    assert [tool["function"]["name"] for tool in model.calls[2]["tools"]] == [
+        "open_document"
+    ]
+    blocked = result.trace.steps[1].executions[0]
+    assert blocked["status"] == "error"
+    assert "per-run call budget" in blocked["error"]
+
+
+def test_agent_recovers_by_opening_document_after_repeated_search(tmp_path):
+    search_call = ModelToolResponse(
+        tool_calls=[
+            ToolCallRequest(
+                id="call-search",
+                name="search_knowledge",
+                arguments={"query": "RAG"},
+            )
+        ]
+    )
+    repeated_search = ModelToolResponse(
+        tool_calls=[
+            ToolCallRequest(
+                id="call-search-again",
+                name="search_knowledge",
+                arguments={"query": "RAG"},
+            )
+        ]
+    )
+    open_call = ModelToolResponse(
+        tool_calls=[
+            ToolCallRequest(
+                id="call-open",
+                name="open_document",
+                arguments={"path": "rag.md", "start_line": 1, "end_line": 3},
+            )
+        ]
+    )
+    runner, model, chunks = build_runner(
+        tmp_path,
+        [search_call, repeated_search, open_call, final_response("")],
+    )
+    runner.max_steps = 4
+    model.responses[3] = final_response(chunks[0].id)
+
+    result = runner.run(user_input="Explain RAG from the document")
+
+    assert result.answer.answer.startswith("RAG retrieves")
+    assert result.tool_calls == [
+        "search_knowledge",
+        "search_knowledge",
+        "open_document",
+    ]
+    assert result.steps == 4
+    assert result.trace.steps[1].executions[0]["status"] == "error"
+    assert result.trace.steps[2].executions[0]["name"] == "open_document"
 
 
 def test_agent_can_recover_from_unknown_tool(tmp_path):

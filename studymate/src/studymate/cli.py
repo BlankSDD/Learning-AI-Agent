@@ -15,7 +15,13 @@ from .evaluation import (
 )
 from .ingest import chunk_document, load_documents
 from .llm import OpenAIAnswerer
-from .search import build_search_index
+from .search import (
+    SQLiteFTS5SearchIndex,
+    SQLiteIndexError,
+    build_sqlite_search_database,
+    build_search_index,
+    open_search_index,
+)
 from .tools import KnowledgeTools, build_knowledge_tool_registry
 from .trace import TraceStore
 
@@ -26,6 +32,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest = subparsers.add_parser("ingest", help="scan and validate knowledge files")
     ingest.add_argument("knowledge_dir", type=Path)
+
+    index_builder = subparsers.add_parser(
+        "build-index", help="build the persistent SQLite FTS5 knowledge index"
+    )
+    index_builder.add_argument(
+        "--knowledge",
+        type=Path,
+        default=Path("knowledge"),
+        help="knowledge directory used to build the index",
+    )
+    index_builder.add_argument(
+        "--search-db",
+        type=Path,
+        default=Path("data/studymate-search.sqlite3"),
+        help="SQLite FTS5 index file to create or replace",
+    )
 
     evaluation = subparsers.add_parser(
         "eval", help="run the Agent against a JSONL evaluation dataset"
@@ -173,7 +195,7 @@ def _add_search_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--search-backend",
         choices=("memory", "sqlite"),
-        default="memory",
+        default="sqlite",
         help="检索后端：memory BM25 风格索引或 sqlite FTS5/BM25",
     )
     parser.add_argument(
@@ -193,13 +215,34 @@ def run_ingest(knowledge_dir: Path) -> int:
     return 0
 
 
+def run_build_index(*, knowledge_dir: Path, search_db: Path) -> int:
+    documents = load_documents(knowledge_dir)
+    chunks = [chunk for document in documents for chunk in chunk_document(document)]
+    if not chunks:
+        print(f"No Markdown or TXT knowledge files found in {knowledge_dir}")
+        return 1
+
+    try:
+        metadata = build_sqlite_search_database(chunks, search_db)
+    except Exception as exc:
+        print(f"SQLite index build failed: {type(exc).__name__}: {exc}")
+        return 1
+
+    print(f"SQLite FTS5 index built: {search_db}")
+    print(
+        f"Documents: {metadata['document_count']}; "
+        f"Chunks: {metadata['chunk_count']}"
+    )
+    return 0
+
+
 def run_eval(
     *,
     knowledge_dir: Path,
     dataset_path: Path,
     output_path: Path,
     retrieval_k: int = 5,
-    search_backend: str = "memory",
+    search_backend: str = "sqlite",
     search_db: Path | None = None,
     case_ids: list[str] | None = None,
     limit: int | None = None,
@@ -221,17 +264,15 @@ def run_eval(
         print("Evaluation dataset is empty.")
         return 1
 
-    documents = load_documents(knowledge_dir)
-    chunks = [chunk for document in documents for chunk in chunk_document(document)]
-    if not chunks:
-        print(f"No Markdown or TXT knowledge files found in {knowledge_dir}")
+    try:
+        search_index = _open_runtime_search_index(
+            knowledge_dir=knowledge_dir,
+            search_backend=search_backend,
+            search_db=search_db,
+        )
+    except (SQLiteIndexError, RuntimeError, ValueError) as exc:
+        print(f"Search index error: {exc}")
         return 1
-
-    search_index = build_search_index(
-        chunks,
-        backend=search_backend,
-        database_path=search_db,
-    )
     knowledge_tools = KnowledgeTools(knowledge_dir, search_index)
     agent = AgentRunner(
         llm=OpenAIAnswerer(),
@@ -248,16 +289,37 @@ def run_eval(
     except ValueError as exc:
         print(f"Evaluation options error: {exc}")
         return 1
-    report = runner.run(cases, dataset=str(dataset_path))
     try:
-        report_path = report.write_json(output_path)
-    except OSError as exc:
-        print(f"Cannot write evaluation report: {exc}")
-        return 1
+        report = runner.run(cases, dataset=str(dataset_path))
+        try:
+            report_path = report.write_json(output_path)
+        except OSError as exc:
+            print(f"Cannot write evaluation report: {exc}")
+            return 1
+    finally:
+        close = getattr(search_index, "close", None)
+        if close is not None:
+            close()
 
     print(report.format_summary())
     print(f"Report: {report_path}")
     return 0 if report.failed == 0 else 1
+
+
+def _open_runtime_search_index(
+    *,
+    knowledge_dir: Path,
+    search_backend: str,
+    search_db: Path | None,
+):
+    if search_backend == "sqlite":
+        return open_search_index(backend="sqlite", database_path=search_db)
+
+    documents = load_documents(knowledge_dir)
+    chunks = [chunk for document in documents for chunk in chunk_document(document)]
+    if not chunks:
+        raise RuntimeError(f"No Markdown or TXT knowledge files found in {knowledge_dir}")
+    return build_search_index(chunks, backend=search_backend, database_path=search_db)
 
 
 def run_update_docs(
@@ -301,15 +363,16 @@ def run_compare_search(
 
     indexes = {}
     setup_errors: dict[str, str] = {}
-    for name, backend in (("memory", "memory"), ("sqlite", "sqlite")):
-        try:
-            indexes[name] = build_search_index(
-                chunks,
-                backend=backend,
-                database_path=search_db,
-            )
-        except Exception as exc:
-            setup_errors[name] = f"{type(exc).__name__}: {exc}"
+    try:
+        indexes["memory"] = build_search_index(chunks, backend="memory")
+    except Exception as exc:
+        setup_errors["memory"] = f"{type(exc).__name__}: {exc}"
+    try:
+        indexes["sqlite"] = open_search_index(
+            backend="sqlite", database_path=search_db
+        )
+    except Exception as exc:
+        setup_errors["sqlite"] = f"{type(exc).__name__}: {exc}"
 
     try:
         written = run_search_comparison(
@@ -335,18 +398,22 @@ def run_chat(
     proxy: str | None,
     trace_dir: Path,
     output_dir: Path,
-    search_backend: str = "memory",
+    search_backend: str = "sqlite",
     search_db: Path | None = None,
 ) -> int:
-    documents = load_documents(knowledge_dir)
-    chunks = [chunk for document in documents for chunk in chunk_document(document)]
-    if not chunks:
-        raise RuntimeError(f"No Markdown or TXT knowledge files found in {knowledge_dir}")
-
-    search_index = build_search_index(
-        chunks,
-        backend=search_backend,
-        database_path=search_db,
+    try:
+        search_index = _open_runtime_search_index(
+            knowledge_dir=knowledge_dir,
+            search_backend=search_backend,
+            search_db=search_db,
+        )
+    except (SQLiteIndexError, RuntimeError, ValueError) as exc:
+        print(f"Search index error: {exc}")
+        return 1
+    loaded_document_count = (
+        search_index.document_count
+        if isinstance(search_index, SQLiteFTS5SearchIndex)
+        else len(load_documents(knowledge_dir))
     )
     knowledge_tools = KnowledgeTools(knowledge_dir, search_index)
     agent = AgentRunner(
@@ -355,6 +422,11 @@ def run_chat(
     )
 
     def refresh_index() -> None:
+        if search_backend == "sqlite":
+            raise SQLiteIndexError(
+                "知识库已更新，但当前 SQLite 索引未自动重建。请退出后运行 "
+                "'python -m studymate build-index'，再重新启动 chat。"
+            )
         refreshed_documents = load_documents(knowledge_dir)
         refreshed_chunks = [
             chunk
@@ -381,6 +453,12 @@ def run_chat(
             proxy=proxy,
         )
         if report.updated_files:
+            if search_backend == "sqlite":
+                return (
+                    report.format()
+                    + "\n知识库文件已更新；SQLite 索引保持不变。请退出后运行 "
+                    "'python -m studymate build-index'，再重新启动 chat。"
+                )
             refresh_index()
         return report.format()
 
@@ -394,7 +472,7 @@ def run_chat(
         output_dir=output_dir,
     )
     print(
-        f"StudyMate loaded {len(documents)} documents. "
+        f"StudyMate loaded {loaded_document_count} documents. "
         f"Search backend: {search_backend}. "
         "Type /help for commands."
     )
@@ -427,6 +505,11 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.command == "ingest":
         return run_ingest(args.knowledge_dir)
+    if args.command == "build-index":
+        return run_build_index(
+            knowledge_dir=args.knowledge,
+            search_db=args.search_db,
+        )
     if args.command == "eval":
         return run_eval(
             knowledge_dir=args.knowledge,

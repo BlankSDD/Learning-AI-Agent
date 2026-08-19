@@ -55,6 +55,13 @@ Chunk
   -> SearchResult
 ~~~
 
+索引生命周期与知识库源文件分开管理：
+
+1. `build-index` 读取 Markdown/TXT、切分 Chunk，并写入 `data/studymate-search.sqlite3`。
+2. Chat、Eval 和 `compare-search` 运行时只读打开这个数据库，不根据知识库重新构建。
+3. 知识库文档更新后，用户需要主动再次运行 `build-index`。
+4. SQLite 数据库是可重建的索引产物，不能替代 `knowledge/` 下的源文件。
+
 这里的 FTS5/BM25 是词法检索：依赖词项是否出现、词频和文档频率；它和 Embedding 向量检索是两条不同的路线。
 
 ## 3.1 EmbeddingSearchIndex（实验性，当前未启用）

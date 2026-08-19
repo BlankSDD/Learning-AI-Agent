@@ -84,6 +84,14 @@ class AgentTrace:
                 lines.append(
                     f"  执行工具：{execution.get('name', 'unknown')}（{'，'.join(details)}）"
                 )
+                rewritten_query = execution.get("rewritten_query")
+                original_query = execution.get("query")
+                if (
+                    isinstance(rewritten_query, str)
+                    and rewritten_query
+                    and rewritten_query != original_query
+                ):
+                    lines.append(f"    rewritten_query: {rewritten_query}")
                 ranking = execution.get("ranking")
                 if ranking:
                     lines.append("    检索排名：")

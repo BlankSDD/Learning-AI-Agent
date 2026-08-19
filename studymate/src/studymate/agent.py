@@ -80,18 +80,20 @@ class AgentRunner:
         retrieved: list[SearchResult] = []
         called_tools: list[str] = []
         tool_call_counts: dict[str, int] = {}
-        force_finalization = False
         trace = AgentTrace()
+        definition_question = _is_simple_definition_question(user_input)
 
         for step in range(1, self.max_steps + 1):
             registered_tools = self.tool_registry.schemas()
             registered_tool_names = {
                 schema["function"]["name"] for schema in registered_tools
             }
-            available_tools = (
-                []
-                if force_finalization
-                else self._available_tool_schemas(tool_call_counts, registered_tools)
+            available_tools = self._available_tool_schemas(
+                tool_call_counts,
+                registered_tools,
+                blocked_tools={"open_document"}
+                if definition_question and tool_call_counts.get("search_knowledge", 0) > 0
+                else set(),
             )
             available_tool_names = {
                 schema["function"]["name"] for schema in available_tools
@@ -139,14 +141,12 @@ class AgentRunner:
             searched_without_evidence = False
             for call in response.tool_calls:
                 called_tools.append(call.name)
-                if (
-                    call.name in registered_tool_names
-                    and call.name not in available_tool_names
-                ):
-                    force_finalization = True
+                call_count = tool_call_counts.get(call.name, 0)
+                if call.name in registered_tool_names and call_count >= self.max_calls_per_tool:
                     error_message = (
                         f"Tool call blocked: {call.name} has already used "
-                        "its per-run call budget. Return a final answer now."
+                        "its per-run call budget. Choose another available tool "
+                        "or return a final answer."
                     )
                     execution = ToolExecution(
                         name=call.name,
@@ -155,7 +155,8 @@ class AgentRunner:
                         is_error=True,
                     )
                 else:
-                    tool_call_counts[call.name] = tool_call_counts.get(call.name, 0) + 1
+                    if call.name in registered_tool_names:
+                        tool_call_counts[call.name] = call_count + 1
                     execution = self.tool_registry.execute(call.name, call.arguments)
                 execution_record = {
                     "name": execution.name,
@@ -164,6 +165,11 @@ class AgentRunner:
                     "error": _execution_error(execution),
                 }
                 if call.name == "search_knowledge" and not execution.is_error:
+                    if isinstance(execution.payload, dict):
+                        for field_name in ("query", "rewritten_query"):
+                            value = execution.payload.get(field_name)
+                            if isinstance(value, str):
+                                execution_record[field_name] = value
                     execution_record["ranking"] = _serialize_search_results(
                         execution.evidence
                     )
@@ -215,8 +221,13 @@ class AgentRunner:
                     "Use the provided tools to retrieve evidence when answering. "
                     "Do not invent facts that are absent from tool results. "
                     "Call search_knowledge at most once for a user question. "
+                    "For a simple definition question, answer after one search and do not "
+                    "open extra documents. Call open_document at most once per run. "
+                    "Never request multiple open_document calls in one model response. "
                     "If its result list is empty, do not call another tool; return a final "
                     "JSON answer that says the knowledge base has insufficient evidence. "
+                    "When search_knowledge returns evidence and more context is needed, "
+                    "call open_document with a path from those results instead of searching again. "
                     "Only call open_document for a path returned by search_knowledge, and "
                     "never repeat a tool call with the same arguments. "
                     "When you have enough evidence, return only JSON with fields "
@@ -253,10 +264,13 @@ class AgentRunner:
         self,
         tool_call_counts: dict[str, int],
         schemas: list[dict[str, Any]],
+        blocked_tools: set[str] | None = None,
     ) -> list[dict[str, Any]]:
+        blocked_tools = blocked_tools or set()
         return [
             schema
             for schema in schemas
+            if schema["function"]["name"] not in blocked_tools
             if tool_call_counts.get(schema["function"]["name"], 0)
             < self.max_calls_per_tool
         ]
@@ -386,3 +400,34 @@ def _serialize_search_results(results: list[SearchResult]) -> list[dict[str, Any
         }
         for rank, result in enumerate(results, start=1)
     ]
+
+
+def _is_simple_definition_question(user_input: str) -> bool:
+    """Identify questions that should be answered from the search result alone."""
+    normalized = " ".join(user_input.casefold().split())
+    detail_markers = (
+        "详细",
+        "流程",
+        "步骤",
+        "原文",
+        "文档",
+        "detail",
+        "detailed",
+        "explain",
+        "how",
+        "why",
+        "difference",
+        "区别",
+    )
+    if any(marker in normalized for marker in detail_markers):
+        return False
+    markers = (
+        "是什么",
+        "是什麼",
+        "什么意思",
+        "有何作用",
+        "what is",
+        "what are",
+        "what does",
+    )
+    return any(marker in normalized for marker in markers)

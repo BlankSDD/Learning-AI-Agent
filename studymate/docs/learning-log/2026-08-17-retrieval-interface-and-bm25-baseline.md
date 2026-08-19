@@ -141,7 +141,7 @@ Document -> Chunk -> FTS5 词法召回 -> SQLite BM25 排序 -> SearchResult
 py -m studymate chat --knowledge .\knowledge --search-backend sqlite --search-db .\data\studymate-search.sqlite3
 ~~~
 
-默认仍然是内存后端。SQLite 数据库文件只是索引缓存，不能替代知识库 Markdown/TXT 源文件。
+当前主流程默认使用预构建的 SQLite 后端。SQLite 数据库是可重建的索引产物，不能替代知识库 Markdown/TXT 源文件；知识库变化后需运行 `py -m studymate build-index`。
 
 ### 当前边界
 

@@ -23,6 +23,8 @@ def test_search_knowledge_tool_returns_results_and_schemas(tmp_path):
     assert execution.is_error is False
     assert execution.evidence[0].chunk.id == chunks[0].id
     assert execution.payload["results"][0]["chunk"]["path"] == "rag.md"
+    assert execution.payload["query"] == "RAG"
+    assert execution.payload["rewritten_query"] == "rag"
     assert registry.schemas()[0]["function"]["name"] == "search_knowledge"
 
 

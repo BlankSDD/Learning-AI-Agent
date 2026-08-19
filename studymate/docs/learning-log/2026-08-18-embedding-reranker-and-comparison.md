@@ -104,7 +104,8 @@ STUDYMATE_RERANK_BASE_URL=
 
 ## 六、当前边界与下一步
 
-- 默认 Chat 使用内存 BM25 风格检索，也可以显式选择 SQLite FTS5/BM25。
+- 当前 Chat 和 Eval 默认打开预构建的 SQLite FTS5/BM25 索引；内存 BM25 风格检索保留给学习和对比。
+- 知识库变化后需要显式运行 `py -m studymate build-index`，正常启动不会重建索引。
 - `compare-search` 只比较两个本地词法后端，并把结果写入 JSONL。
 - 已运行完整 pytest：`71 passed in 3.10s`，测试过程未调用 Embedding API。
 - CLI 的 `chat`、`eval` 和 `compare-search` 仅开放 `memory` 与 `sqlite` 两个本地检索后端。

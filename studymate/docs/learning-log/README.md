@@ -21,3 +21,5 @@
 5. [2026-08-17 检索接口与 BM25 风格基线](2026-08-17-retrieval-interface-and-bm25-baseline.md)
 6. [2026-08-18 Embedding、Reranker 与检索结果对比](2026-08-18-embedding-reranker-and-comparison.md)
 7. [2026-08-19 Evaluation 低频执行、用例筛选与重试](2026-08-19-evaluation-pacing-and-retry.md)
+8. [2026-08-20 紧凑术语完整覆盖](2026-08-20-compound-term-coverage.md)
+9. [2026-08-20 预构建 SQLite 索引与下一步计划](2026-08-20-prebuilt-sqlite-index.md)

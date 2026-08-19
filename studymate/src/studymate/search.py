@@ -9,6 +9,10 @@ from typing import Protocol, runtime_checkable
 
 from .models import Chunk, SearchResult
 
+
+class SQLiteIndexError(RuntimeError):
+    """Raised when a pre-built SQLite FTS5 index cannot be opened."""
+
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9]+|[\u4e00-\u9fff]")
 CAMEL_CASE_PATTERN = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 OPAQUE_IDENTIFIER_PATTERN = re.compile(r"\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b")
@@ -28,6 +32,7 @@ COMPOUND_ALIASES = {
 # Chinese. Keep the expansion small and domain-oriented so it improves recall
 # without turning every query into a broad synonym search.
 QUERY_ALIASES = {
+    "mcp": ("mcp", "model", "context", "protocol"),
     "自定义工具": ("custom", "tool", "tools"),
     "自定义": ("custom",),
     "工具调用": ("tool", "calling", "function"),
@@ -73,6 +78,64 @@ QUERY_STOPWORDS = {
     "with",
 }
 
+# Remove task instructions and generic explanation words before ranking. The
+# model may add these words while planning a tool call, but they are not the
+# topic the local lexical index should rank.
+QUERY_REWRITE_NOISE = (
+    "请先搜索",
+    "先搜索",
+    "再打开",
+    "打开命中的文档",
+    "命中的文档",
+    "结合原文",
+    "原文解释",
+    "原文说明",
+    "如何运行流程",
+    "如何运行",
+    "运行机制",
+    "运行流程",
+    "运行步骤",
+    "状态循环",
+    "步骤",
+    "流程",
+    "机制",
+    "状态",
+    "循环",
+    "如何",
+    "运行",
+    "资料",
+    "文档",
+    "内容",
+    "信息",
+    "解释",
+    "说明",
+    "step",
+    "steps",
+    "process",
+    "workflow",
+    "mechanism",
+    "explain",
+    "explanation",
+    "details",
+    "document",
+    "documents",
+    "source",
+    "sources",
+    "information",
+)
+
+DEFINITION_QUERY_MARKERS = (
+    "是什么",
+    "含义",
+    "意思",
+    "定义",
+    "what is",
+    "what's",
+    "define",
+    "definition",
+    "meaning",
+)
+
 MIN_QUERY_COVERAGE = 0.5
 
 
@@ -98,6 +161,164 @@ def normalize_text(text: str) -> str:
 
 def tokenize(text: str) -> list[str]:
     return TOKEN_PATTERN.findall(normalize_text(text))
+
+
+def rewrite_query(query: str) -> str:
+    """Keep topic terms while removing model-added search instructions.
+
+    This is a local lexical rewrite. It does not call an LLM and it does not
+    rewrite the answer returned to the user.
+    """
+    rewritten = normalize_text(query)
+    phrases = (*QUERY_REWRITE_NOISE, *QUERY_STOPWORDS)
+    for phrase in sorted(phrases, key=len, reverse=True):
+        normalized_phrase = normalize_text(phrase)
+        if not normalized_phrase:
+            continue
+        if normalized_phrase.isascii():
+            rewritten = re.sub(
+                rf"(?<![A-Za-z0-9_]){re.escape(normalized_phrase)}(?![A-Za-z0-9_])",
+                " ",
+                rewritten,
+            )
+        else:
+            rewritten = rewritten.replace(normalized_phrase, " ")
+
+    # Keep Chinese topic phrases intact for QUERY_ALIASES while treating
+    # punctuation and separators as boundaries for the lexical index.
+    rewritten = re.sub(r"[^A-Za-z0-9_\u4e00-\u9fff]+", " ", rewritten)
+    return " ".join(rewritten.split())
+
+
+def split_comparison_query(query: str) -> tuple[str, ...]:
+    """Extract independent topics from a comparison question.
+
+    A lexical index should not require one Chunk to contain every concept in
+    a comparison. Returning one rewritten query per side lets the caller
+    retrieve evidence for both concepts and merge the ranked lists fairly.
+    Non-comparison questions return an empty tuple so normal ranking is
+    unchanged.
+    """
+    normalized = normalize_text(query).strip()
+    if not normalized:
+        return ()
+
+    patterns = (
+        re.compile(
+            r"^(?P<left>.+?)\s+(?:和|与|跟|同)\s+"
+            r"(?P<right>.+?)\s*(?:有(?:什么)?|有何)?"
+            r"(?:区别|差异|关系|对比|比较)\s*[?？!！。]*$"
+        ),
+        re.compile(
+            r"^(?:what\s+is\s+)?(?:the\s+)?difference\s+between\s+"
+            r"(?P<left>.+?)\s+and\s+(?P<right>.+?)\s*[?？!！.]*$",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^(?P<left>.+?)\s+(?:vs\.?|versus)\s+"
+            r"(?P<right>.+?)\s*[?？!！.]*$",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^compare\s+(?P<left>.+?)\s+and\s+"
+            r"(?P<right>.+?)\s*[?？!！.]*$",
+            re.IGNORECASE,
+        ),
+    )
+    for pattern in patterns:
+        match = pattern.match(normalized)
+        if not match:
+            continue
+        topics = tuple(
+            rewritten
+            for part in (match.group("left"), match.group("right"))
+            if (rewritten := rewrite_query(part))
+        )
+        if len(topics) == 2 and topics[0].casefold() != topics[1].casefold():
+            return topics
+    return ()
+
+
+def _merge_topic_results(
+    result_groups: list[list[SearchResult]], top_k: int
+) -> list[SearchResult]:
+    """Interleave topic rankings so one side cannot fill the whole Top-K."""
+    merged: list[SearchResult] = []
+    seen: set[str] = set()
+    for rank in range(max((len(results) for results in result_groups), default=0)):
+        for results in result_groups:
+            if rank >= len(results):
+                continue
+            result = results[rank]
+            if result.chunk.id in seen:
+                continue
+            merged.append(result)
+            seen.add(result.chunk.id)
+            if len(merged) >= top_k:
+                return merged
+    return merged
+
+
+def _definition_anchor_boost(
+    query: str, rewritten_query: str, chunk: Chunk
+) -> float:
+    """Boost an explicit acronym expansion for definition-style questions."""
+    normalized_query = normalize_text(query)
+    if not any(marker in normalized_query for marker in DEFINITION_QUERY_MARKERS):
+        return 0.0
+
+    query_tokens = tokenize(rewritten_query)
+    if len(query_tokens) != 1:
+        return 0.0
+    term = query_tokens[0]
+    aliases = QUERY_ALIASES.get(term)
+    if not aliases:
+        return 0.0
+
+    content_tokens = tokenize(f"{chunk.title} {chunk.text}")
+    expansion = (term, *aliases[1:]) if aliases[0] == term else (term, *aliases)
+    reverse_expansion = (*expansion[1:], term)
+    if _contains_token_phrase(content_tokens, expansion):
+        return 32.0
+    if _contains_token_phrase(content_tokens, reverse_expansion):
+        return 24.0
+    return 0.0
+
+
+def _required_compound_phrases(query: str) -> tuple[tuple[str, ...], ...]:
+    """Return known multi-token concepts that must be fully covered.
+
+    The normal coverage threshold intentionally allows partial matches for
+    broad natural-language queries. That is unsafe for a known compound term:
+    ``agentruntime`` should not match a chunk that only contains ``agent``.
+    Only compact spellings are strict. This avoids requiring every evidence
+    chunk to repeat a product name such as ``Claude Code`` when the chunk
+    already contains the requested topic. CamelCase spellings are handled by
+    case-folding the original query before this check.
+    """
+    normalized_query = query.casefold()
+    required: list[tuple[str, ...]] = []
+    for compact, expanded in COMPOUND_ALIASES.items():
+        if not re.search(
+            rf"(?<![a-z0-9]){re.escape(compact)}(?![a-z0-9])",
+            normalized_query,
+        ):
+            continue
+        phrase = tuple(tokenize(expanded))
+        if len(phrase) > 1:
+            if phrase not in required:
+                required.append(phrase)
+    return tuple(required)
+
+
+def _has_required_compound_coverage(
+    required_phrases: tuple[tuple[str, ...], ...], available_terms: object
+) -> bool:
+    """Check that every component of each known compound term is present."""
+    return all(
+        all(term in available_terms for term in phrase)
+        for phrase in required_phrases
+    )
 
 
 class InMemorySearchIndex:
@@ -136,14 +357,33 @@ class InMemorySearchIndex:
     def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
         if top_k <= 0:
             return []
+        topics = split_comparison_query(query)
+        if topics:
+            return _merge_topic_results(
+                [self._search_single(topic, top_k, require_full_coverage=True) for topic in topics],
+                top_k,
+            )
+        return self._search_single(query, top_k)
 
-        query_terms = expand_query_terms(query)
+    def _search_single(
+        self,
+        query: str,
+        top_k: int,
+        *,
+        require_full_coverage: bool = False,
+    ) -> list[SearchResult]:
+        if top_k <= 0:
+            return []
+
+        rewritten_query = rewrite_query(query)
+        query_terms = expand_query_terms(rewritten_query)
         if not query_terms:
             return []
         if _has_unknown_opaque_identifier(query, self._chunks):
             return []
+        required_compound_phrases = _required_compound_phrases(query)
 
-        phrase_terms = _query_phrases(query)
+        phrase_terms = _query_phrases(rewritten_query)
         results: list[SearchResult] = []
         for chunk in self._chunks:
             chunk_id = chunk.id
@@ -151,12 +391,16 @@ class InMemorySearchIndex:
             matched_terms = sorted(term for term in query_terms if term in term_counts)
             if not matched_terms:
                 continue
+            if not _has_required_compound_coverage(
+                required_compound_phrases, term_counts
+            ):
+                continue
 
             content_score = sum(
                 self._bm25_score(term, term_counts) for term in matched_terms
             )
             coverage = len(matched_terms) / len(query_terms)
-            if coverage < MIN_QUERY_COVERAGE:
+            if coverage < (1.0 if require_full_coverage else MIN_QUERY_COVERAGE):
                 continue
             title_score = sum(
                 self._inverse_document_frequency(term)
@@ -188,6 +432,7 @@ class InMemorySearchIndex:
                 + (path_score * 5.0)
                 + (filename_score * 4.0)
                 + (phrase_hits * 1.25)
+                + _definition_anchor_boost(query, rewritten_query, chunk)
             )
             results.append(
                 SearchResult(
@@ -223,11 +468,11 @@ class InMemorySearchIndex:
 class SQLiteFTS5SearchIndex:
     """SQLite FTS5 index using SQLite's built-in BM25 ranking function.
 
-    The index is rebuilt from the supplied chunks when constructed. This keeps
-    the persistent database deterministic after a knowledge-base update while
-    still allowing SQLite to handle matching and ranking efficiently.
+    Constructing the class builds the index. Runtime callers should use
+    :meth:`open` so an existing database is opened without rebuilding it.
     """
 
+    _SCHEMA_VERSION = "1"
     _BM25_WEIGHTS = (0.0, 5.0, 1.75, 1.0)
 
     def __init__(
@@ -243,6 +488,62 @@ class SQLiteFTS5SearchIndex:
         self._connection = sqlite3.connect(connection_target)
         self._connection.row_factory = sqlite3.Row
         self._chunks = _deduplicate_chunks(chunks)
+        self._initialize_chunk_caches()
+        self._rebuild()
+
+    @classmethod
+    def open(cls, database_path: str | Path) -> "SQLiteFTS5SearchIndex":
+        """Open a previously built index without scanning or chunking files."""
+        path = Path(database_path)
+        if not path.is_file():
+            raise SQLiteIndexError(
+                f"SQLite 索引不存在：{path}。请先运行 "
+                f"'python -m studymate build-index --search-db {path}'"
+            )
+
+        instance = cls.__new__(cls)
+        instance.database_path = path
+        try:
+            instance._connection = sqlite3.connect(str(path))
+            instance._connection.row_factory = sqlite3.Row
+            metadata = instance._read_metadata()
+            if metadata.get("schema_version") != cls._SCHEMA_VERSION:
+                raise SQLiteIndexError(
+                    f"SQLite 索引版本不兼容：{path}。请重新运行 build-index"
+                )
+            rows = instance._connection.execute(
+                """
+                SELECT chunk_id, document_id, path, title, text, start_line, end_line
+                FROM chunk_metadata
+                ORDER BY rowid
+                """
+            ).fetchall()
+            instance._connection.execute("SELECT chunk_id FROM chunks_fts LIMIT 1")
+            instance._chunks = [
+                Chunk(
+                    id=row["chunk_id"],
+                    document_id=row["document_id"],
+                    path=row["path"],
+                    title=row["title"],
+                    text=row["text"],
+                    start_line=row["start_line"],
+                    end_line=row["end_line"],
+                )
+                for row in rows
+            ]
+            instance._initialize_chunk_caches()
+            instance.metadata = metadata
+            return instance
+        except SQLiteIndexError:
+            instance.close()
+            raise
+        except (sqlite3.Error, KeyError) as exc:
+            instance.close()
+            raise SQLiteIndexError(
+                f"SQLite 索引不可用：{path}。请重新运行 build-index"
+            ) from exc
+
+    def _initialize_chunk_caches(self) -> None:
         self._content_tokens = {
             chunk.id: set(tokenize(f"{chunk.title} {chunk.text}"))
             for chunk in self._chunks
@@ -256,7 +557,25 @@ class SQLiteFTS5SearchIndex:
         self._tokenized_paths = {
             chunk.id: tokenize(chunk.path) for chunk in self._chunks
         }
-        self._rebuild()
+        self.metadata = {
+            "schema_version": self._SCHEMA_VERSION,
+            "document_count": str(len({chunk.document_id for chunk in self._chunks})),
+            "chunk_count": str(len(self._chunks)),
+        }
+
+    @property
+    def document_count(self) -> int:
+        return int(self.metadata.get("document_count", "0"))
+
+    @property
+    def chunk_count(self) -> int:
+        return int(self.metadata.get("chunk_count", "0"))
+
+    def _read_metadata(self) -> dict[str, str]:
+        rows = self._connection.execute(
+            "SELECT key, value FROM index_metadata"
+        ).fetchall()
+        return {str(row["key"]): str(row["value"]) for row in rows}
 
     def _rebuild(self) -> None:
         try:
@@ -265,6 +584,12 @@ class SQLiteFTS5SearchIndex:
                     """
                     DROP TABLE IF EXISTS chunks_fts;
                     DROP TABLE IF EXISTS chunk_metadata;
+                    DROP TABLE IF EXISTS index_metadata;
+
+                    CREATE TABLE index_metadata (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    );
 
                     CREATE TABLE chunk_metadata (
                         chunk_id TEXT PRIMARY KEY,
@@ -286,6 +611,14 @@ class SQLiteFTS5SearchIndex:
                     """
                 )
                 self._connection.executemany(
+                    "INSERT INTO index_metadata (key, value) VALUES (?, ?)",
+                    [
+                        ("schema_version", self._SCHEMA_VERSION),
+                        ("document_count", str(len({chunk.document_id for chunk in self._chunks}))),
+                        ("chunk_count", str(len(self._chunks))),
+                    ],
+                )
+                self._connection.executemany(
                     """
                     INSERT INTO chunk_metadata
                         (chunk_id, document_id, path, title, text, start_line, end_line)
@@ -304,6 +637,7 @@ class SQLiteFTS5SearchIndex:
                         for chunk in self._chunks
                     ],
                 )
+                self.metadata = self._read_metadata()
                 self._connection.executemany(
                     "INSERT INTO chunks_fts (chunk_id, path, title, text) VALUES (?, ?, ?, ?)",
                     [
@@ -327,17 +661,36 @@ class SQLiteFTS5SearchIndex:
     def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
         if top_k <= 0:
             return []
+        topics = split_comparison_query(query)
+        if topics:
+            return _merge_topic_results(
+                [self._search_single(topic, top_k, require_full_coverage=True) for topic in topics],
+                top_k,
+            )
+        return self._search_single(query, top_k)
 
-        query_terms = expand_query_terms(query)
+    def _search_single(
+        self,
+        query: str,
+        top_k: int,
+        *,
+        require_full_coverage: bool = False,
+    ) -> list[SearchResult]:
+        if top_k <= 0:
+            return []
+
+        rewritten_query = rewrite_query(query)
+        query_terms = expand_query_terms(rewritten_query)
         if not query_terms:
             return []
         if _has_unknown_opaque_identifier(query, self._chunks):
             return []
+        required_compound_phrases = _required_compound_phrases(query)
 
         # Each term is quoted because it has already been tokenized. Joining
         # with OR lets the shared coverage rule reject low-quality partial hits.
         match_query = " OR ".join(_quote_fts_term(term) for term in sorted(query_terms))
-        phrase_terms = _query_phrases(query)
+        phrase_terms = _query_phrases(rewritten_query)
         rows = self._connection.execute(
             """
             SELECT
@@ -366,9 +719,13 @@ class SQLiteFTS5SearchIndex:
             )
             if not matched_terms:
                 continue
+            if not _has_required_compound_coverage(
+                required_compound_phrases, self._content_tokens[chunk_id]
+            ):
+                continue
 
             coverage = len(matched_terms) / len(query_terms)
-            if coverage < MIN_QUERY_COVERAGE:
+            if coverage < (1.0 if require_full_coverage else MIN_QUERY_COVERAGE):
                 continue
 
             phrase_hits = sum(
@@ -382,19 +739,21 @@ class SQLiteFTS5SearchIndex:
             # SQLite's bm25() returns lower (usually negative) values for
             # better matches. SearchResult exposes a non-negative score with
             # higher-is-better semantics, shared by all backends.
+            result_chunk = Chunk(
+                id=chunk_id,
+                document_id=row["document_id"],
+                path=row["path"],
+                title=row["title"],
+                text=row["text"],
+                start_line=row["start_line"],
+                end_line=row["end_line"],
+            )
             score = max(0.0, -float(row["bm25_score"]))
             score += (coverage * 0.5) + (phrase_hits * 1.25)
+            score += _definition_anchor_boost(query, rewritten_query, result_chunk)
             results.append(
                 SearchResult(
-                    chunk=Chunk(
-                        id=chunk_id,
-                        document_id=row["document_id"],
-                        path=row["path"],
-                        title=row["title"],
-                        text=row["text"],
-                        start_line=row["start_line"],
-                        end_line=row["end_line"],
-                    ),
+                    chunk=result_chunk,
                     score=score,
                     matched_terms=matched_terms,
                 )
@@ -407,6 +766,32 @@ class SQLiteFTS5SearchIndex:
         if getattr(self, "_connection", None) is not None:
             self._connection.close()
             self._connection = None
+
+
+def build_sqlite_search_database(
+    chunks: list[Chunk], database_path: str | Path
+) -> dict[str, str]:
+    """Build a persistent SQLite index and return its metadata."""
+    index = SQLiteFTS5SearchIndex(chunks, database_path=database_path)
+    try:
+        return dict(index.metadata)
+    finally:
+        index.close()
+
+
+def open_search_index(
+    *, backend: str = "sqlite", database_path: str | Path | None = None
+) -> SearchIndex:
+    """Open a pre-built runtime index without rebuilding it."""
+    normalized_backend = backend.casefold()
+    if normalized_backend in {"sqlite", "sqlite-fts5"}:
+        if database_path is None:
+            raise SQLiteIndexError("SQLite 运行时索引必须提供 --search-db")
+        return SQLiteFTS5SearchIndex.open(database_path)
+    raise ValueError(
+        f"Unsupported runtime search backend: {backend}. "
+        "Only 'sqlite' has a pre-built runtime index."
+    )
 
 
 def build_search_index(

@@ -22,6 +22,7 @@ class EvaluationCase:
     input: str
     intent: str | None = None
     expected_sources: tuple[str, ...] = ()
+    acceptable_sources: tuple[str, ...] = ()
     required_terms: tuple[str, ...] = ()
     expected_tools: tuple[str, ...] = ()
     expected_stop_reason: str | None = None
@@ -47,6 +48,9 @@ class EvaluationCase:
             input=user_input.strip(),
             intent=intent.strip() if isinstance(intent, str) else None,
             expected_sources=_string_tuple(value.get("expected_sources", []), "expected_sources", line_number),
+            acceptable_sources=_string_tuple(
+                value.get("acceptable_sources", []), "acceptable_sources", line_number
+            ),
             required_terms=_string_tuple(value.get("required_terms", []), "required_terms", line_number),
             expected_tools=_string_tuple(value.get("expected_tools", []), "expected_tools", line_number),
             expected_stop_reason=_optional_string(
@@ -61,6 +65,7 @@ class EvaluationCase:
             "input": self.input,
             "intent": self.intent,
             "expected_sources": list(self.expected_sources),
+            "acceptable_sources": list(self.acceptable_sources),
             "required_terms": list(self.required_terms),
             "expected_tools": list(self.expected_tools),
             "expected_stop_reason": self.expected_stop_reason,
@@ -160,7 +165,11 @@ class EvaluationReport:
     @property
     def metrics(self) -> dict[str, Any]:
         evaluated = [result for result in self.results if result.metrics is not None]
-        positive = [result for result in evaluated if result.case.expected_sources]
+        positive = [
+            result
+            for result in evaluated
+            if result.case.expected_sources or result.case.acceptable_sources
+        ]
         labeled_abstention = [
             result
             for result in evaluated
@@ -387,10 +396,10 @@ class EvaluationRunner:
                 result.tool_calls, case.expected_tools
             ),
             "retrieval_matches": _expected_sources_match(
-                case.expected_sources, retrieved_sources
+                case.expected_sources, case.acceptable_sources, retrieved_sources
             ),
             "citations_match": _expected_sources_match(
-                case.expected_sources, citation_sources
+                case.expected_sources, case.acceptable_sources, citation_sources
             ),
             "required_terms": _contains_all(answer.answer, case.required_terms),
             "abstention_matches": (
@@ -489,10 +498,20 @@ def _optional_bool(value: Any, line_number: int) -> bool | None:
     return value
 
 
-def _expected_sources_match(expected: tuple[str, ...], actual: list[str]) -> bool:
-    if not expected:
+def _expected_sources_match(
+    expected: tuple[str, ...], acceptable: tuple[str, ...], actual: list[str]
+) -> bool:
+    if not expected and not acceptable:
         return not actual
-    return all(any(_source_matches(item, candidate) for candidate in actual) for item in expected)
+    strict_match = all(
+        any(_source_matches(item, candidate) for candidate in actual) for item in expected
+    )
+    alternative_match = not acceptable or any(
+        _source_matches(item, candidate)
+        for item in acceptable
+        for candidate in actual
+    )
+    return strict_match and alternative_match
 
 
 def _source_matches(expected: str, actual: str) -> bool:
@@ -540,25 +559,48 @@ def _calculate_case_metrics(
 ) -> EvaluationCaseMetrics:
     top_sources = retrieved_sources[:retrieval_k]
     expected_sources = case.expected_sources
+    acceptable_sources = case.acceptable_sources
 
-    if expected_sources:
-        matched_retrieved = _count_matching_expected(expected_sources, top_sources)
+    if expected_sources or acceptable_sources:
+        matched_strict = _count_matching_expected(expected_sources, top_sources)
+        matched_alternative = bool(
+            acceptable_sources
+            and any(
+                _source_matches(item, candidate)
+                for item in acceptable_sources
+                for candidate in top_sources
+            )
+        )
+        expected_slot_count = len(expected_sources) + bool(acceptable_sources)
+        matched_retrieved = matched_strict + int(matched_alternative)
         hit_at_k = matched_retrieved > 0
-        recall_at_k = matched_retrieved / len(expected_sources)
+        recall_at_k = matched_retrieved / expected_slot_count
         precision_at_k = (
-            matched_retrieved / len(top_sources) if top_sources else 0.0
+            _count_relevant_sources(
+                top_sources,
+                expected_sources + acceptable_sources,
+            )
+            / len(top_sources)
+            if top_sources
+            else 0.0
         )
         first_match = next(
             (
                 index + 1
                 for index, source in enumerate(top_sources)
-                if _matches_any_expected(source, expected_sources)
+                if _matches_any_expected(
+                    source, expected_sources + acceptable_sources
+                )
             ),
             None,
         )
         mrr = 1.0 / first_match if first_match is not None else 0.0
-        citation_accuracy = _citation_accuracy(citation_sources, expected_sources)
-        citation_coverage = _coverage(citation_sources, expected_sources)
+        citation_accuracy = _citation_accuracy(
+            citation_sources, expected_sources, acceptable_sources
+        )
+        citation_coverage = _coverage(
+            citation_sources, expected_sources, acceptable_sources
+        )
     else:
         no_retrieval = not top_sources
         hit_at_k = no_retrieval
@@ -592,22 +634,47 @@ def _count_matching_expected(expected: tuple[str, ...], actual: list[str]) -> in
     )
 
 
+def _count_relevant_sources(
+    actual: list[str], expected: tuple[str, ...]
+) -> int:
+    return sum(1 for source in actual if _matches_any_expected(source, expected))
+
+
 def _matches_any_expected(expected: str, actual: list[str] | tuple[str, ...]) -> bool:
     return any(_source_matches(expected, candidate) for candidate in actual)
 
 
-def _citation_accuracy(citations: list[str], expected: tuple[str, ...]) -> float:
+def _citation_accuracy(
+    citations: list[str],
+    expected: tuple[str, ...],
+    acceptable: tuple[str, ...] = (),
+) -> float:
     if not citations:
         return 0.0
     return sum(
-        1 for citation in citations if _matches_any_expected(citation, expected)
+        1
+        for citation in citations
+        if _matches_any_expected(citation, expected + acceptable)
     ) / len(citations)
 
 
-def _coverage(actual: list[str], expected: tuple[str, ...]) -> float:
-    if not expected:
+def _coverage(
+    actual: list[str], expected: tuple[str, ...], acceptable: tuple[str, ...] = ()
+) -> float:
+    if not expected and not acceptable:
         return 1.0 if not actual else 0.0
-    return _count_matching_expected(expected, actual) / len(expected)
+    strict_matches = _count_matching_expected(expected, actual)
+    alternative_match = bool(
+        acceptable
+        and any(
+            _source_matches(item, candidate)
+            for item in acceptable
+            for candidate in actual
+        )
+    )
+    return (strict_matches + int(alternative_match)) / (
+        len(expected) + bool(acceptable)
+    )
 
 
 def _mean(values: Iterable[float]) -> float:
@@ -629,7 +696,13 @@ def _is_retryable_exception(exc: Exception) -> bool:
         visited.add(id(current))
         if isinstance(current, (TimeoutError, ConnectionError)):
             return True
-        text = str(current).casefold()
+        error_body = getattr(current, "body", None)
+        error_code = getattr(current, "code", None)
+        text = " ".join(
+            str(value)
+            for value in (str(current), error_code, error_body)
+            if value is not None
+        ).casefold()
         if any(
             marker in text
             for marker in (
@@ -640,6 +713,9 @@ def _is_retryable_exception(exc: Exception) -> bool:
                 "timed out",
                 "timeout",
                 "temporarily unavailable",
+                "get_channel_failed",
+                "no available channel",
+                "channel failed",
                 "too many requests",
                 "rate limit",
             )

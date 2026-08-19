@@ -49,6 +49,8 @@ def test_agent_trace_formats_a_readable_last_run_summary():
                     "name": "search_knowledge",
                     "status": "ok",
                     "evidence_count": 1,
+                    "query": "Agent Loop 如何运行流程",
+                    "rewritten_query": "agent loop",
                     "ranking": [
                         {
                             "rank": 1,
@@ -69,6 +71,7 @@ def test_agent_trace_formats_a_readable_last_run_summary():
 
     assert "停止原因：final_answer" in summary
     assert "search_knowledge" in summary
+    assert "rewritten_query: agent loop" in summary
     assert "证据片段：1" in summary
     assert "检索排名" in summary
     assert "1. rag.md:1-3 score=2.500000 terms=rag" in summary

@@ -7,7 +7,7 @@ from typing import Any
 
 from .models import SearchResult
 from .rerank import Reranker
-from .search import SearchIndex
+from .search import SearchIndex, rewrite_query, split_comparison_query
 
 SCORE_TYPES = {
     "memory": "bm25_style",
@@ -48,6 +48,8 @@ def run_search_comparison(
             record: dict[str, Any] = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "query": query,
+                "rewritten_query": rewrite_query(query),
+                "comparison_topics": list(split_comparison_query(query)),
                 "top_k": top_k,
                 "backends": backend_results,
                 "score_types": {
@@ -73,7 +75,17 @@ def run_search_comparison(
 
 
 def format_search_comparison(record: dict[str, Any]) -> str:
-    lines = [f"\nQuery: {record['query']}"]
+    lines = [
+        f"\nQuery: {record['query']}",
+        f"Rewritten query: {record.get('rewritten_query') or '(empty)'}",
+    ]
+    topics = record.get("comparison_topics") or []
+    if topics:
+        lines.append(
+            "Comparison topics: "
+            + " | ".join(topics)
+            + " (results interleaved by topic)"
+        )
     for name, results in record.get("backends", {}).items():
         score_type = record.get("score_types", {}).get(name, "unknown")
         lines.append(f"[{name}; score={score_type}]")

@@ -26,6 +26,16 @@ py -m studymate eval `
 py -m studymate eval --retrieval-k 5
 ```
 
+`eval` 默认打开 `data/studymate-search.sqlite3` 这个预构建的 SQLite FTS5 索引，不会在评测启动时重新扫描知识库。首次使用或知识库文档发生变化后，先执行：
+
+```powershell
+py -m studymate build-index `
+  --knowledge .\knowledge `
+  --search-db .\data\studymate-search.sqlite3
+```
+
+这里的 SQLite 是 Agent 实际使用的检索后端；评测集仍负责比较“期望来源”和“实际来源”，并检查工具调用、停止原因、引用和回答关键词。SQLite 负责提供检索结果，Evaluation 负责判断这次 Agent 执行是否符合预期。
+
 命令会：
 
 1. 加载知识库和评测集。
@@ -51,10 +61,8 @@ py -m studymate compare-search `
 
 该命令会比较：
 
-- `memory`：内存 BM25 风格检索；
-- `sqlite`：SQLite FTS5/BM25；
-- `memory`：内存 BM25 风格检索；
-- `sqlite`：SQLite FTS5/BM25。
+- `memory`：临时构建的内存 BM25 风格检索，主要用于学习和小样本对比；
+- `sqlite`：打开已经由 `build-index` 生成的 SQLite FTS5/BM25 索引。
 
 分数只在同一后端内部比较。最终应结合目标来源是否进入 Top-K、排名、Hit@K、Recall@K、Precision@K、MRR 和人工相关性判断。Embedding 和 Reranker 暂不参与主流程，相关源码仅作为后续学习材料保留。
 
@@ -67,7 +75,11 @@ py -m studymate compare-search `
   "id": "mcp-001",
   "input": "MCP 是什么？",
   "intent": "question",
-  "expected_sources": ["claude-code/07-agent-sdk/mcp.md"],
+  "expected_sources": [],
+  "acceptable_sources": [
+    "claude-code/99-other/glossary.md",
+    "ai-agent/tool-calling-vs-mcp.md"
+  ],
   "required_terms": ["agent"],
   "expected_tools": ["search_knowledge"],
   "expected_stop_reason": "final_answer",
@@ -82,7 +94,8 @@ py -m studymate compare-search `
 | `id` | 用例的稳定标识 |
 | `input` | 发送给 Agent 的用户问题 |
 | `intent` | 可选意图，会作为输入前缀 |
-| `expected_sources` | 期望出现的检索和引用来源；空列表表示不应有来源 |
+| `expected_sources` | 严格期望出现的检索和引用来源；多个来源必须全部命中。与 `acceptable_sources` 都为空时，表示不应有来源 |
+| `acceptable_sources` | 可选的等价来源集合；多个候选中至少命中一个即可。适合概念定义等有多个正确资料来源的题目 |
 | `required_terms` | 最终回答必须包含的词 |
 | `expected_tools` | 期望按顺序出现的工具调用 |
 | `expected_stop_reason` | 期望停止原因，如 `final_answer` 或 `empty_search` |
@@ -120,10 +133,12 @@ py -m studymate compare-search `
 | `abstained` | Agent 是否声明证据不足 |
 | `abstention_correct` | 存在 `should_abstain` 时，实际拒答是否符合预期 |
 
+`expected_sources` 和 `acceptable_sources` 可以并存：前者仍必须全部命中，后者额外要求至少命中一个。对指标而言，一个候选来源集合视为一个预期槽位：Hit@K 命中任一严格或候选来源即成功；Recall@K 和 Citation Coverage 按严格来源数量加一个候选槽位计算；Precision@K 与 Citation Accuracy 则将所有候选路径都作为相关来源判断。
+
 `summary.metrics` 会按以下口径汇总：
 
 - `hit_at_k` 和 `precision_at_k` 包含全部用例；无来源题在没有召回时算正确。
-- `recall_at_k`、`mrr` 和 `citation.coverage` 只统计 `expected_sources` 非空的正向用例。
+- `recall_at_k`、`mrr` 和 `citation.coverage` 只统计 `expected_sources` 或 `acceptable_sources` 非空的正向用例。
 - `citation.accuracy`、`abstention.rate` 和延迟统计包含所有成功执行的用例。
 - 模型或工具异常的用例不会伪造检索指标，但仍会计入失败数量。
 

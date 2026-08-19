@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from .ingest import SUPPORTED_SUFFIXES
 from .models import Chunk, SearchResult
-from .search import SearchIndex
+from .search import SearchIndex, rewrite_query
 from .tool_registry import ToolDefinition, ToolOutput, ToolRegistry
 
 
@@ -39,6 +39,7 @@ class KnowledgeTools:
         return ToolOutput(
             payload={
                 "query": query,
+                "rewritten_query": rewrite_query(query),
                 "results": [result.model_dump(mode="json") for result in results],
             },
             evidence=results,

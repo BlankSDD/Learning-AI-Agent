@@ -157,7 +157,48 @@ py -m studymate chat --trace-dir .\my-traces
 
 输出文件包含问题、结构化回答、引用、检索排名和 Trace，但不包含 API Key 或知识库正文。启动时可以使用 `--output-dir` 修改无路径参数时的默认目录。
 
-### 3.1 运行 Agent Evaluation
+### 3.1 常用命令速查
+
+以下命令都在 `studymate` 项目根目录执行。下面使用项目虚拟环境中的 Python；如果已经激活虚拟环境，也可以把 `.\.venv\Scripts\python.exe` 替换成 `py`。
+
+首次使用，或 `knowledge/` 下的 Markdown/TXT 文档发生新增、修改、删除后，重新生成 SQLite FTS5/BM25 索引：
+
+```powershell
+.\.venv\Scripts\python.exe -m studymate build-index `
+  --knowledge .\knowledge `
+  --search-db .\data\studymate-search.sqlite3
+```
+
+启动命令行 Agent：
+
+```powershell
+.\.venv\Scripts\python.exe -m studymate chat `
+  --knowledge .\knowledge
+```
+
+进入 Chat 后，上一轮问答可以这样查看和保存：
+
+```text
+/trace
+/output
+/output .\outputs\mcp-question.json
+```
+
+`/trace` 只用于开发诊断，会显示 Agent 步骤、工具调用、停止原因和检索排名，不会把 Trace 传给模型。`/output` 会把上一轮问题、结构化回答、引用、检索排名和 Trace 保存为 JSON，不包含 API Key 或知识库正文。
+
+比较内存 BM25 风格检索和 SQLite FTS5/BM25 的排名：
+
+```powershell
+.\.venv\Scripts\python.exe -m studymate compare-search `
+  --knowledge .\knowledge `
+  --query "agent loop 和 agent runtime 有什么区别？" `
+  --query "What is MCP?" `
+  --output .\logs\search-comparison.jsonl
+```
+
+`compare-search` 是检索诊断命令，不会调用在线模型，也不参与 Agent 的正常执行；它会在终端展示两个后端的排名和分数，并把结果保存到 JSONL。知识库更新后的推荐顺序是：先运行 `update-docs`（如果需要拉取在线文档），再运行 `build-index`，最后启动 Chat 或 Eval。
+
+### 3.2 运行 Agent Evaluation
 
 `Trace` 记录 Agent 做了什么，`Evaluation` 判断这次执行是否符合预期。Evaluation 不参与当前任务的循环控制；AgentRunner 先根据工具预算、空检索和最大步数结束任务，Evaluation 再检查停止原因、工具调用、检索来源、引用、关键词和拒答行为。
 
@@ -175,7 +216,7 @@ py -m studymate eval --knowledge .\\knowledge `
 py -m studymate eval --retrieval-k 5
 ~~~
 
-### 3.2 低频评测与用例筛选
+### 3.3 低频评测与用例筛选
 
 完整评测集适合在模型网关稳定、请求额度充足时运行。日常开发建议先选择高价值用例，并在用例之间留出间隔：
 
@@ -200,13 +241,14 @@ py -m studymate eval `
 - 每条结果的 `attempts` 字段记录实际请求次数，便于区分评测失败和网关瞬时故障。
 - `STUDYMATE_TIMEOUT_SECONDS` 控制单次模型请求超时，默认 60 秒。网关不稳定时可以临时设置为 20 秒，避免单个请求长时间阻塞。
 
-本轮推荐的高价值用例是：`q001` 验证正常检索、引用和多工具流程；`q019` 验证模型是否按要求完成 `search_knowledge -> open_document`；`q020` 验证知识库无答案时的 `empty_search` 和拒答行为。评测失败后应先查看报告中的 `checks`、`trace` 和 `attempts`，再判断是模型行为、评测预期、检索质量还是网关问题。
+本轮推荐的高价值用例是：`q001` 验证 MCP 定义题的 `search_knowledge -> final_answer` 最小路径和 glossary 引用；`q019` 验证模型是否按要求完成 `search_knowledge -> open_document`；`q020` 验证知识库无答案时的 `empty_search` 和拒答行为。评测失败后应先查看报告中的 `checks`、`trace` 和 `attempts`，再判断是模型行为、评测预期、检索质量还是网关问题。
 
 评测数据支持以下字段：
 
 - `id`、`input`：测试用例标识和用户问题。
 - `intent`：可选的 `question`、`goal` 或 `keyword`，会作为 Agent 输入前缀。
-- `expected_sources`：期望检索和引用的文档路径；空列表表示期望没有来源。
+- `expected_sources`：严格期望检索和引用的文档路径；多个路径必须全部命中。与 `acceptable_sources` 都为空时，表示期望没有来源。
+- `acceptable_sources`：等价来源集合；其中任意一个命中即可。概念定义题可能有多份内容正确的资料，不应因模型选择其中之一而误判失败。
 - `required_terms`：最终回答中必须出现的关键词。
 - `expected_tools`：期望按顺序调用的工具。
 - `expected_stop_reason`：例如 `final_answer`、`empty_search` 或 `max_steps`。
@@ -219,7 +261,7 @@ py -m studymate eval `
 - `abstention.rate`、`abstention.accuracy`：实际拒答比例，以及标记了 `should_abstain` 的用例预测是否正确。
 - `latency.average_ms`：完成 Agent 用例的平均耗时。
 
-Recall、MRR 和 Citation Coverage 只在 `expected_sources` 非空的正向用例上汇总；Hit、Precision、Citation Accuracy 和拒答率包含无来源用例。无来源用例在没有误召回、没有引用时视为正确。
+Recall、MRR 和 Citation Coverage 只在 `expected_sources` 或 `acceptable_sources` 非空的正向用例上汇总；Hit、Precision、Citation Accuracy 和拒答率包含无来源用例。无来源用例在没有误召回、没有引用时视为正确。候选来源集合在 Recall 和 Coverage 中视为一个预期槽位，在 Precision 和 Citation Accuracy 中的任一路径均视为相关来源。
 
 命令返回码为：全部用例通过返回 `0`，任意用例失败返回 `1`。每个用例的报告包含 `loop_completed`，因此可以直接发现 Agent 是否因为 `max_steps` 异常结束；这只是评测结果，不会在运行中替代 AgentRunner 的停止条件。
 
@@ -327,8 +369,8 @@ STUDYMATE_API_KEY=填写你的 DeepSeek API Key
 - 文档标题识别。
 - 文档切分。
 - 可替换的 `SearchIndex` 检索接口。
-- 本地 BM25 风格检索，支持中英文领域词扩展、查询归一化、英文停用词、短语匹配以及标题/路径加权排序。
-- SQLite FTS5 / BM25 检索后端，可通过 CLI 参数切换。
+- 本地 BM25 风格检索，支持中英文领域词扩展、查询归一化、规则查询改写、英文停用词、短语匹配以及标题/路径加权排序。
+- SQLite FTS5 / BM25 检索后端，当前 Chat 和 Eval 默认使用预构建索引。
 - CLI 对话服务。
 - 问题、学习目标、关键词输入分类。
 - 回答来源校验。
@@ -342,17 +384,36 @@ STUDYMATE_API_KEY=填写你的 DeepSeek API Key
 - `/trace` 检索排名展示和 `/output` 单轮问答 JSON 导出。
 - Agent Evaluation、JSONL 评测数据和 JSON 汇总报告。
 
-当前默认搜索基线是 `InMemorySearchIndex`，通过 `SearchIndex` 接口向 Agent 工具提供检索能力。它使用无额外依赖的 BM25 风格评分，并加入中英文领域词扩展、`agentloop`/CamelCase/连字符归一化、查询停用词过滤、短语匹配以及标题/路径加权。
+当前主流程使用预构建的 `SQLiteFTS5SearchIndex`，通过 `SearchIndex` 接口向 Agent 工具提供检索能力。它使用 SQLite FTS5 建立词法索引，并用 BM25 排序；查询仍加入中英文领域词扩展、`agentloop`/CamelCase/连字符归一化、查询停用词过滤、短语匹配以及标题/路径加权。对于原始 query 中明确出现的紧凑术语（例如 `agentruntime`、`agentloop`、`toolcalling`），展开后的每个组成词必须在同一个 Chunk 中命中，避免只命中 `agent` 的部分结果混入；普通的 `agent runtime` 或 `Claude Code 自定义工具` 查询仍使用通用覆盖率规则。
+
+检索前还会执行一次本地规则查询改写：`rewrite_query()` 会保留主题词，移除模型在工具参数中加入的“请先搜索、再打开文档、结合原文解释”等动作词、英文疑问词和常见停用词，并清理标点。例如：
+
+```text
+原始查询：请先搜索 Agent Loop 的资料，再打开命中的文档，结合原文解释它如何运行。
+改写查询：agent loop
+```
+
+这里的“改写”只改写传给本地检索索引的 query，不改写用户问题，也不改写最终答案；当前实现完全基于规则，不产生额外模型 API 请求。原始查询和改写查询都会进入 Agent Trace，便于定位召回问题。当前尚未实现的是基于对话历史的指代消解或 LLM 查询改写。
 
 另一个可选后端是 `SQLiteFTS5SearchIndex`：它把每个 `Chunk` 的路径、标题和正文写入 SQLite FTS5 虚拟表，使用 SQLite 内置 `bm25()` 排序，再转换回相同的 `SearchResult`。它仍然是关键词/词法检索，不是 Embedding 语义检索。两个后端的分数绝对值不需要相同，应该用评测集中的 Hit@K、Recall@K、Precision@K 和 MRR 比较召回质量。
 
-默认运行内存后端：
+首次使用或知识库发生变化时，先构建 SQLite 索引：
+
+```powershell
+py -m studymate build-index `
+  --knowledge .\knowledge `
+  --search-db .\data\studymate-search.sqlite3
+```
+
+该命令会扫描知识库、切分 Chunk 并重建索引。正常启动 Chat、Eval 或 `compare-search` 时只打开已有数据库，不再重新扫描和重建。知识库文档更新后，需要重新运行一次 `build-index`；SQLite 文件是索引产物，不替代 `knowledge/` 下的 Markdown/TXT 源文件。
+
+默认运行 SQLite 后端：
 
 ```powershell
 py -m studymate chat --knowledge .\knowledge
 ```
 
-切换到 SQLite FTS5 / BM25：
+运行时也可以显式指定 SQLite 索引路径：
 
 ```powershell
 py -m studymate chat `
@@ -361,7 +422,7 @@ py -m studymate chat `
   --search-db .\data\studymate-search.sqlite3
 ```
 
-评测时也可以切换后端：
+评测默认也使用同一个预构建 SQLite 索引：
 
 ```powershell
 py -m studymate eval `
@@ -370,7 +431,7 @@ py -m studymate eval `
   --search-db .\data\studymate-search.sqlite3
 ```
 
-SQLite 数据库在启动时根据当前知识库的 `Chunk` 重建，因此执行 `/update` 后，当前会话会自动重新切分并重建索引。`data/` 下的数据库文件是本地生成物，不包含 API Key，建议不要提交到 Git。
+如果索引不存在或版本不兼容，Chat/Eval 会直接提示运行 `build-index`，不会静默退回内存检索。`--search-backend memory` 仍可显式启用内存 BM25 风格实现，用于学习和小样本对比；它不是当前主流程后端。`data/` 下的数据库文件是本地生成物，不包含 API Key，建议不要提交到 Git。
 
 ### 检索结果对比
 
@@ -384,7 +445,9 @@ py -m studymate compare-search `
   --output .\logs\search-comparison.jsonl
 ```
 
-命令会在 CMD 打印每个后端的排名、分数、路径、行号和命中词，并将同样的信息写入 JSONL。这个日志用于比较检索行为，不是 Agent 的 Trace，也不会发送给模型。Embedding 和 LLM Reranker 代码暂时保留在源码中用于学习，但不属于当前 StudyMate 主流程。
+命令会在 CMD 打印每个后端的排名、分数、路径、行号和命中词，并将同样的信息写入 JSONL。这个日志用于比较检索行为，不是 Agent 的 Trace，也不会发送给模型。SQLite 后端会打开预构建索引，内存后端只在该命令中临时构建用于教学对比。Embedding 和 LLM Reranker 代码暂时保留在源码中用于学习，但不属于当前 StudyMate 主流程。
+
+当 query 是比较问题时，例如“agentloop 和 agent runtime 有什么区别？”或“What is the difference between tool calling and MCP?”，程序会先拆成两个主题分别检索，再按主题交错合并结果，避免一个主题占满 Top-K。此时输出中的 `Rewritten query` 是统一化后的整体 query，`Comparison topics` 是实际检索的主题；交错列表中的分数不能当作跨主题的全局降序，只适合观察每个主题是否被召回以及同一后端内的相对排名。
 
 ## 7. 当前问答实现
 
@@ -433,7 +496,13 @@ Agent 不再由 `ChatService` 固定执行检索，而是把 `search_knowledge` 
 
 `search_knowledge` 没有返回证据时，`AgentRunner` 会以 `empty_search` 停止本轮任务，直接返回“知识库资料不足”，不会继续请求模型。检索到证据后，模型只能基于传入片段生成回答。
 
-模型返回的引用还会经过校验。如果引用不属于本次检索结果，回答会被拦截，避免产生无法追溯的来源。
+模型返回的引用还会经过校验。如果引用不属于本次检索结果，回答会被拦截，避免产生无法追溯的来源。对于明显的定义型问题（例如“什么是 MCP？”或“What is RAG?”），搜索成功后会关闭 `open_document`，直接基于搜索证据最终化；详细解释、流程和区别类问题仍可打开文档。这样可以减少不必要的模型请求和次要文档引用。
+
+### 7.3.1 为什么 Chat 和 Eval 都使用 SQLite
+
+Chat 使用 SQLite 是因为 SQLite 是 Agent 实际执行 `search_knowledge` 时的检索后端：用户提问后，Agent 决定是否调用工具，工具再从 SQLite FTS5/BM25 索引中返回证据。它不是只在评测命令中才使用的离线组件。
+
+Eval 使用 SQLite 是为了评估默认 Chat/Agent 路径拿到的真实检索结果。SQLite 负责提供结果，评测集负责判断结果是否命中期望来源、工具调用、停止原因、引用和回答关键词。Evaluation 不是 SQLite，也不会参与 Agent 循环控制。
 
 ### 7.4 当前能力边界
 
@@ -442,15 +511,17 @@ Agent 不再由 `ChatService` 固定执行检索，而是把 `search_knowledge` 
 | 本地 Markdown/TXT 检索 | 已实现 |
 | SearchIndex 可替换检索接口 | 已实现；由 `build_search_index()` 统一构造，支持 InMemorySearchIndex 和 SQLiteFTS5SearchIndex |
 | BM25 风格本地排序 | 已实现；包含词频、逆文档频率和文档长度归一化 |
-| SQLite FTS5 / BM25 检索 | 已实现；通过 `--search-backend sqlite` 选择，保留统一 Chunk 和 SearchResult |
+| SQLite FTS5 / BM25 检索 | 已实现；通过 `build-index` 预构建，Chat/Eval 默认只读打开，保留统一 Chunk 和 SearchResult |
 | AI 模型生成回答 | 已实现；普通路径与 Agent 路径均可使用流式 |
-| Agent 工具调用循环 | 已实现，最多 5 步；每个只读工具默认每轮任务仅可成功调用一次，重复调用后强制进入最终化 |
+| Agent 工具调用循环 | 已实现，最多 5 步；每个只读工具默认每轮任务仅可成功调用一次，重复调用会被拒绝，但仍保留其他未使用工具 |
+| 定义型问题最小工具路径 | 已实现；定义题搜索后直接最终化，详细问题仍允许打开文档 |
 | Agent 工具注册和参数校验 | 已实现 |
 | 当前会话短期历史 | 已实现，仅内存保存 |
 | Agent Trace 和问答落盘 | 已实现，按进程写入 `traces/session-*.jsonl`，不参与模型上下文 |
 | Agent Evaluation | 已实现，检查停止原因、工具、检索、引用、关键词和拒答行为，并输出检索质量指标 |
-| 跨进程恢复会话历史 | 尚未实现 |
-| 基于历史改写检索 | 尚未实现 |
+| 跨进程恢复会话历史 | 尚未实现；计划下一阶段实现 |
+| 本地规则查询改写 | 已实现；检索前清理工具指令和停用词，并在 Trace 中保留改写前后值 |
+| 基于历史改写检索 | 尚未实现；当前不使用历史生成新的检索 query |
 | Embedding/向量检索 | 暂不启用；源码保留为后续学习实验 |
 | Reranker | 暂不启用；当前只验证本地词法检索排序 |
 | 流式请求 | 已实现；当前 CMD 聚合完整 JSON 后一次性显示 |
@@ -466,7 +537,7 @@ Agent 不再由 `ChatService` 固定执行检索，而是把 `search_knowledge` 
 | 2026-08-02 | 短期对话历史 | `src/studymate/chat.py`、`src/studymate/llm.py` | 保存当前进程内最近消息；支持 `/reset`，不做持久化。 |
 | 2026-08-02 | 引用安全校验 | `src/studymate/citations.py`、`src/studymate/models.py` | 校验模型引用是否来自实际检索片段。 |
 | 2026-08-02 | 在线文档更新 | `config/docs_sources.json`、`src/studymate/docs_updater.py`、`scripts/update_docs.py` | 支持 Claude Code、OpenCode、Codex 配置化更新，并写入 `knowledge/<source-id>/`。 |
-| 2026-08-02 | CMD 更新命令 | `src/studymate/input.py`、`src/studymate/chat.py`、`src/studymate/cli.py` | 支持 `update-docs`、`/update`、`/update codex`，更新后自动重载检索索引。 |
+| 2026-08-02 | CMD 更新命令 | `src/studymate/input.py`、`src/studymate/chat.py`、`src/studymate/cli.py` | 支持 `update-docs`、`/update`、`/update codex`；内存后端会话内自动重载，SQLite 主流程提示退出后运行 `build-index`。 |
 | 2026-08-02 | 测试和开发依赖 | `tests/`、`pyproject.toml` | 已安装 pytest，当前测试结果为 `25 passed`。 |
 | 2026-08-02 | 模型服务错误处理 | `.env`、`src/studymate/llm.py`、`src/studymate/chat.py`、`tests/integration/test_query_workflow.py` | 支持 DeepSeek/OpenAI 兼容接口；将 402 余额不足、鉴权失败和限流错误转换为可读提示，并显示当前接口和模型，避免会话崩溃；测试结果为 `26 passed`。 |
 | 2026-08-02 | 通用 Provider 配置 | `.env`、`.env.example`、`src/studymate/llm.py`、`tests/contract/test_llm_contract.py` | 增加 `type/provider/endpointType/apiKey/baseUrl/model` 对应配置；兼容 NewAPI 的 `/v1` 地址和不同 OpenAI 兼容模型；测试结果为 `27 passed`。 |
@@ -476,7 +547,8 @@ Agent 不再由 `ChatService` 固定执行检索，而是把 `search_knowledge` 
 | 2026-08-02 | Claude 引用格式兼容 | `src/studymate/llm.py`、`tests/contract/test_llm_contract.py` | 将模型返回的已检索 `chunk_id` 字符串补全为可审计引用对象；非法响应转换为可读错误，不再导致 CLI 堆栈退出；真实 CMD 问答验证通过。 |
 | 2026-08-07 | 第一阶段最小 Agent | `src/studymate/agent.py`、`src/studymate/tool_registry.py`、`src/studymate/tools.py`、`src/studymate/llm.py` | 增加有步数上限的 Agent Loop、原生 Tool Calling、知识库搜索和安全文档读取工具；新增 Agent 和工具 TDD 用例。 |
 | 2026-08-09 | NewAPI/Claude Agent 流式兼容 | `src/studymate/llm.py`、`src/studymate/agent.py`、`.env.example`、`tests/contract/test_llm_contract.py` | 聚合流式 `tool_calls` 增量，兼容内容块格式和 `confidence: "high"` 等常见模型输出；NewAPI 留空时自动启用流式。以 Huazi/Claude 真实问答验证工具调用和最终回答均成功；全量测试 `46 passed`。 |
-| 2026-08-09 | Agent 工具预算与最终化 | `src/studymate/agent.py`、`src/studymate/llm.py`、`tests/unit/test_agent.py`、`tests/contract/test_llm_contract.py` | 每个工具默认只允许调用一次；重复调用会切换到无工具最终化。为兼容 Bedrock，上述最终化会将工具结果转为普通上下文后再请求模型，避免 `TOOL_CONFIG_MISSING`；以 Huazi/Claude 真实问答验证不会再循环至步骤上限。 |
+| 2026-08-09 | Agent 工具预算与最终化 | `src/studymate/agent.py`、`src/studymate/llm.py`、`tests/unit/test_agent.py`、`tests/contract/test_llm_contract.py` | 每个工具默认只允许调用一次；重复调用会被拒绝，但仍保留其他未使用工具。所有工具预算耗尽后才进入无工具最终化；为兼容 Bedrock，最终化会将工具结果转为普通上下文再请求模型，避免 `TOOL_CONFIG_MISSING`。 |
+| 2026-08-20 | 重复工具调用恢复 | `src/studymate/agent.py`、`tests/unit/test_agent.py`、`docs/09-agent-loop.md` | 修复重复 `search_knowledge` 后立即禁用所有工具的问题：重复调用仍然失败并写入 Trace，但 `open_document` 等未使用工具继续可用；新增重复搜索后打开文档的回归测试。 |
 | 2026-08-09 | Claude 最终 JSON 兼容 | `src/studymate/llm.py`、`tests/contract/test_llm_contract.py` | 响应解析器兼容 `confidence: "high"` 和 `next_steps: "单条建议"` 等常见变体，统一为内部 `Answer` 类型要求的数值和字符串列表。 |
 | 2026-08-09 | Agent Trace 与问答落盘 | `src/studymate/trace.py`、`src/studymate/agent.py`、`src/studymate/chat.py`、`src/studymate/cli.py`、`tests/unit/test_trace.py` | 每轮记录工具可用性、调用、结果摘要、停止原因和耗时；问题与回答追加到按会话分组的 JSONL。新增 `/trace` 查看上一轮，不将 Trace 传回模型。 |
 | 2026-08-16 | 可引用的文档读取证据 | `src/studymate/tools.py`、`tests/unit/test_tools.py` | `open_document` 为读取的行范围生成稳定 `chunk_id` 并回传证据，使打开的文档也能参与引用校验和 Evaluation。 |
@@ -488,8 +560,16 @@ Agent 不再由 `ChatService` 固定执行检索，而是把 `search_knowledge` 
 | 2026-08-18 | 检索范围收敛 | `src/studymate/cli.py`、`src/studymate/comparison.py`、`.env.example` | 主流程关闭 Embedding 和 LLM Reranker，只保留内存 BM25 风格检索与 SQLite FTS5/BM25；相关源码保留为学习实验，避免意外 API 成本。 |
 | 2026-08-18 | Trace 检索排名与问答导出 | `src/studymate/agent.py`、`src/studymate/trace.py`、`src/studymate/chat.py`、`src/studymate/cli.py` | `/trace` 显示 `search_knowledge` 的 Top-K 排名；`/output` 保存问题、回答、引用、检索排名和 Trace 到 JSON；不调用 Embedding。测试结果为 `72 passed`。 |
 | 2026-08-19 | 低频 Agent Evaluation | `src/studymate/evaluation.py`、`src/studymate/cli.py`、`src/studymate/llm.py`、`.env.example`、`tests/eval/test_evaluation.py` | 增加 `--case-id`、`--limit`、用例间隔、瞬时错误重试和单次请求超时；报告记录 `attempts`。完整 pytest 为 `76 passed`。真实 SQLite 评测中 `q001`、`q020` 通过；`q019` 因模型重复调用已耗尽预算的 `search_knowledge` 而失败，定位为 Agent 行为/评测预期问题，不是连接失败。 |
+| 2026-08-19 | 规则查询改写 | `src/studymate/search.py`、`src/studymate/tools.py`、`src/studymate/agent.py`、`src/studymate/trace.py`、`tests/unit/test_search.py` | 在本地检索前移除搜索动作词、疑问词和停用词，避免 BM25/FTS5 被模型规划文本污染；`search_knowledge` 返回并在 `/trace` 显示 `query` 与 `rewritten_query`。SQLite 本地验证中 `agent loop` Top-1 命中 `claude-code/07-agent-sdk/agent-loop.md`，不调用 Embedding API。 |
+| 2026-08-19 | 对比查询拆分与检索诊断 | `src/studymate/search.py`、`src/studymate/comparison.py`、`tests/unit/test_search.py`、`tests/unit/test_comparison.py` | 对中文/英文比较问题拆分检索主题并交错合并；`compare-search` 输出 `rewritten_query`、`comparison_topics` 和交错提示；对 `MCP` 定义题增加缩写/全称锚点加权。四问题本地验证完成，完整 pytest 为 `93 passed`，未调用 Embedding API。 |
+| 2026-08-20 | 紧凑术语完整覆盖 | `src/studymate/search.py`、`tests/unit/test_search.py` | 对原始 query 中的 `agentruntime`、`agentloop`、`toolcalling` 等紧凑术语要求展开后的组成词全部命中同一 Chunk；同步应用于内存和 SQLite 后端。`agentruntime` 不再返回只包含 `agent` 的部分结果；普通 `agent` 和中英文混合查询不受影响。完整 pytest 为 `94 passed`，未调用 Embedding API。 |
+| 2026-08-20 | 预构建 SQLite 索引 | `src/studymate/search.py`、`src/studymate/cli.py`、`tests/unit/test_search.py`、`tests/unit/test_cli.py` | 新增 `build-index`；Chat、Eval 和 `compare-search` 只读打开预构建 SQLite FTS5 数据库，默认不再启动重建。当前索引为 221 份文档、40,866 个 Chunk；完整 pytest 为 `99 passed`。 |
+| 2026-08-20 | 命令与学习记录整理 | `README.md`、`docs/learning-log/README.md`、`docs/learning-log/2026-08-20-prebuilt-sqlite-index.md` | 集中记录 `build-index`、`compare-search`、`/trace` 和 `/output` 的可执行用法、职责边界、今日学习结论与 2026-08-21 Agent Memory 学习计划。 |
+| 2026-08-19 | DeepSeek-V4-Flash 网关复验 | `src/studymate/llm.py`、`src/studymate/evaluation.py` | 使用桌面配置文件注入临时环境变量，保持 `STUDYMATE_STREAM=true`、`STUDYMATE_RESPONSE_FORMAT=none`；`q001` 和 `q019` 均 `1/1 passed`。`q019` 成功完成 `search_knowledge -> open_document -> final_answer`，3 步、2 次工具调用，引用准确率和覆盖率均为 100%；`q001` 虽通过但额外打开了 2 个文档，Precision@5 为 25%、引用准确率为 50%，后续需要优化工具路径和引用质量；未修改或提交 `.env`、API Key。 |
+| 2026-08-19 | Agent 工具路径与临时通道重试 | `src/studymate/agent.py`、`src/studymate/evaluation.py`、`tests/unit/test_agent.py`、`tests/eval/test_evaluation.py` | 定义型问题在搜索后直接最终化，批量重复工具调用仍按预算拦截；增加 Rivo `get_channel_failed` 等临时通道错误的有限重试，并保留 401/403/402 不重试。完整 pytest 为 `84 passed`；线上优化复验因 Rivo 连续返回 `get_channel_failed`，两次尝试后停止。 |
+| 2026-08-19 | MCP 定义检索与 q001 标注修正 | `src/studymate/search.py`、`tests/unit/test_search.py`、`tests/eval/questions.jsonl` | 将 `MCP` 扩展为 `MCP + Model Context Protocol`，使词法检索优先召回协议定义而非配置片段；真实 SQLite Top-1 为 `claude-code/99-other/glossary.md`。q001 预期来源同步改为 glossary，保留单次 `search_knowledge` 的最小工具路径。 |
 
-当前待办方向：使用 `compare-search` 和评测集验证内存 BM25 与 SQLite FTS5/BM25 的实际排名；之后再学习 Chunk 参数、混合检索、跨进程记忆和 MCP。
+当前下一步：学习并实现 Agent Memory 的基础能力，先完成跨进程短期会话恢复，再设计用户可控的长期记忆。SQLite 知识库索引、Trace 和 Eval 的职责保持不变；Embedding、LLM Reranker 和自动长期记忆暂不进入主流程。
 
 ## 9. 开发流程
 

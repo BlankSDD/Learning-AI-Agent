@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from studymate.agent import AgentResult
 from studymate.evaluation import (
@@ -38,6 +39,12 @@ class StatusError(Exception):
     def __init__(self, status_code):
         super().__init__(f"HTTP {status_code}")
         self.status_code = status_code
+
+
+class BodyCodeError(Exception):
+    def __init__(self, code):
+        super().__init__("temporary gateway failure")
+        self.body = {"code": code}
 
 
 def make_result(*, stop_reason="final_answer", need_more_context=False):
@@ -95,6 +102,7 @@ def test_load_evaluation_dataset_supports_optional_expectations(tmp_path):
                 "id": "case-1",
                 "input": "What is MCP?",
                 "expected_sources": ["mcp.md"],
+                "acceptable_sources": ["glossary.md"],
                 "required_terms": ["agent"],
                 "expected_tools": ["search_knowledge"],
                 "expected_stop_reason": "final_answer",
@@ -108,7 +116,69 @@ def test_load_evaluation_dataset_supports_optional_expectations(tmp_path):
     cases = load_evaluation_dataset(path)
 
     assert cases[0].expected_tools == ("search_knowledge",)
+    assert cases[0].acceptable_sources == ("glossary.md",)
     assert cases[0].should_abstain is False
+
+
+def test_q001_accepts_equivalent_mcp_definition_sources():
+    cases = load_evaluation_dataset(Path(__file__).with_name("questions.jsonl"))
+    q001 = next(case for case in cases if case.id == "q001")
+
+    assert q001.expected_sources == ()
+    assert q001.acceptable_sources == (
+        "claude-code/99-other/glossary.md",
+        "ai-agent/tool-calling-vs-mcp.md",
+        "claude-code/04-agent-development/mcp-quickstart.md",
+        "claude-code/04-agent-development/mcp.md",
+    )
+    assert q001.expected_tools == ("search_knowledge",)
+
+
+def test_evaluation_accepts_one_of_alternative_sources():
+    case = EvaluationCase(
+        id="mcp-alternatives",
+        input="What is MCP?",
+        acceptable_sources=("glossary.md", "mcp.md"),
+        expected_tools=("search_knowledge",),
+    )
+
+    result = EvaluationRunner(StubAgent(make_result())).run_case(case)
+
+    assert result.passed is True
+    assert result.checks["retrieval_matches"] is True
+    assert result.checks["citations_match"] is True
+    assert result.metrics is not None
+    assert result.metrics.hit_at_k is True
+    assert result.metrics.recall_at_k == 1.0
+    assert result.metrics.citation_coverage == 1.0
+
+
+def test_evaluation_fails_when_no_alternative_source_is_hit():
+    case = EvaluationCase(
+        id="mcp-alternatives-miss",
+        input="What is MCP?",
+        acceptable_sources=("glossary.md", "other.md"),
+    )
+
+    result = EvaluationRunner(StubAgent(make_result())).run_case(case)
+
+    assert result.passed is False
+    assert result.checks["retrieval_matches"] is False
+    assert result.checks["citations_match"] is False
+
+
+def test_evaluation_keeps_strict_expected_sources_semantics():
+    case = EvaluationCase(
+        id="mcp-strict",
+        input="What is MCP?",
+        expected_sources=("mcp.md", "another.md"),
+    )
+
+    result = EvaluationRunner(StubAgent(make_result())).run_case(case)
+
+    assert result.passed is False
+    assert result.metrics is not None
+    assert result.metrics.recall_at_k == 0.5
 
 
 def test_evaluation_passes_when_answer_and_loop_are_grounded():
@@ -281,3 +351,28 @@ def test_evaluation_retries_rate_limit_but_not_forbidden_error():
     assert forbidden_result.passed is False
     assert forbidden_result.attempts == 1
     assert forbidden_sleeps == []
+
+
+def test_evaluation_retries_temporary_model_channel_failure():
+    retry_agent = SequenceAgent([
+        BodyCodeError("get_channel_failed"),
+        make_result(),
+    ])
+    sleeps = []
+
+    result = EvaluationRunner(
+        retry_agent,
+        retries=1,
+        retry_delay_seconds=2,
+        sleep_fn=sleeps.append,
+    ).run_case(
+        EvaluationCase(
+            id="channel-retry",
+            input="one",
+            expected_sources=("mcp.md",),
+        )
+    )
+
+    assert result.passed is True
+    assert result.attempts == 2
+    assert sleeps == [2]
